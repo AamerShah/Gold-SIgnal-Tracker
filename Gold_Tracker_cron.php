@@ -3,40 +3,24 @@
  * gold_monitor.php — Gold Buy Signal Monitor + Live Dashboard
  * PHP 8.1+ | Cron: every minute | Single file
  *
- * ── ENHANCEMENTS (this version) ──────────────────────────────────
- *  E1  Signal tooltip in plain English — no jargon for end users.
- *  E2  Hero shows RETAIL price (igold.ae) only. AED everywhere.
- *      USD/spot removed from public UI entirely.
- *  E3  Browser Push Notifications — bell icon in header.
- *      Same alerts that go to Telegram appear in browser.
- *      Notification permission requested on bell click only.
- *  E4  Alert deduplication fixed — alerts keyed by key+date so the
- *      same signal cannot appear twice in alert_log on the same day.
- *  E5  Stale-crumb race condition fixed — state reload before save
- *      in get_yahoo_auth() to avoid overwriting fresh crumb.
- *  E6  New signal S12: Price Channel Break — price breaks above a
- *      recent 15-run resistance level (descending channel break).
- *  E7  New signal S13: Pre-Market Low Test — when price during
- *      session approaches within 0.3% of pre-market low, fire an
- *      "approaching support" alert as early warning.
- *  E8  Day-low alert dedup: uses key+date not just cooldown, so it
- *      cannot repeat after state reset (previous bug).
- *  E9  All OHLC, stats, alerts display AED only (no USD shown).
- *  E10 API endpoint now includes pending_notifications array so
- *      browser JS can show notifications via Service Worker.
+ * ── CHANGES (this version) ────────────────────────────────────────
+ *  U1  Hero sub-heading: "Retail Price: AED X/g" with all karat prices
+ *      (24K, 22K, 21K, 18K, 15K, 10K) in one grey line. Spot line removed.
+ *  U2  TIP ETF value shown in AED equivalent (not USD).
+ *  U3  Currency selector (AED/USD/INR/PKR) near bell icon, saved in cookie.
+ *      All displayed prices convert to selected currency.
+ *  U4  Light/Dark theme toggle at top of page, persisted in cookie.
+ *  U5  Session low (and all signals) now POOL alert conditions during
+ *      cooldown. After cooldown expires, if a pooled condition was missed,
+ *      the alert fires immediately. Low-water-mark tracked per signal.
+ *  U6  Tooltips across site are semi-transparent (rgba backdrop).
+ *  U7  Signal plain-English tooltips moved to debug section only —
+ *      removed from main signal chips to reduce distraction.
+ *  U8  Light theme: full visibility audit — all text/border/background
+ *      tokens adjusted so nothing disappears in light mode.
  *
- * ── BUGS FIXED (inherited) ───────────────────────────────────────
- *  #1  Day high/low inconsistency: tracked from session_open only.
- *  #2  AED display vs USD math mismatch: igold retail for hero,
- *      Yahoo spot→AED for all OHLC math.
- *  #3  Stale high guard added.
- *  #4  Weekend close: Saturday AND Sunday skipped.
- *  #5  Bounce signal: session_low gate.
- *  #6  Day-low alert: requires day_chg < -0.1%.
- *  #7  consec_up: fires only when day_chg > -0.5%.
- *  #8  full_signal_block removed.
- *  #9  Cooldowns tuned.
- *  #10 All OHLC math uses spot_aed.
+ * ── ENHANCEMENTS (inherited) ─────────────────────────────────────
+ *  E1–E10 retained from previous version.
  */
 
 // ══════════════════════════════════════════════════════════════════
@@ -67,8 +51,8 @@ define('EMA_FAST',                   5);
 define('EMA_SLOW',                  20);
 define('MACRO_CONF_DXY_DROP',    0.20);
 define('MACRO_CONF_TIP_RISE',    0.20);
-define('CHANNEL_BREAK_WINDOW',      15); // E6: runs to look back for resistance
-define('PM_SUPPORT_PCT',          0.30); // E7: % within pre-market low to alert
+define('CHANNEL_BREAK_WINDOW',      15);
+define('PM_SUPPORT_PCT',          0.30);
 
 // ── Active hours ──────────────────────────────────────────────────
 define('ACTIVE_HOUR_START',         8);
@@ -87,8 +71,8 @@ define('COOLDOWN_DXY_WEAK',       360);
 define('COOLDOWN_ORB',            180);
 define('COOLDOWN_EMA_CROSS',      180);
 define('COOLDOWN_MACRO_CONF',      60);
-define('COOLDOWN_CHANNEL_BREAK',  120); // E6
-define('COOLDOWN_PM_SUPPORT',      60); // E7
+define('COOLDOWN_CHANNEL_BREAK',  120);
+define('COOLDOWN_PM_SUPPORT',      60);
 
 // ── Unit constants ────────────────────────────────────────────────
 define('USD_TO_AED',           3.6725);
@@ -103,6 +87,17 @@ define('PRICE_HIST_MAX',           60);
 define('STATE_FILE',   __DIR__ . '/gold_monitor_state.json');
 define('LOG_FILE',     __DIR__ . '/gold_monitor.log');
 define('COOKIE_FILE',  __DIR__ . '/yf_cookies.txt');
+
+// ── Karat purity ratios ───────────────────────────────────────────
+// Used to compute retail price per karat from 24K base price
+define('KARAT_RATIOS', serialize([
+    '24K' => 1.0000,
+    '22K' => 0.9167,
+    '21K' => 0.8750,
+    '18K' => 0.7500,
+    '15K' => 0.6250,
+    '10K' => 0.4167,
+]));
 
 // ══════════════════════════════════════════════════════════════════
 //  BOOTSTRAP + ROUTING
@@ -158,13 +153,21 @@ function serve_api(): void {
             $notified_ts[] = $al_key;
         }
     }
-    // Keep last 200 notified keys to avoid memory bloat
     if (count($notified_ts) > 200) {
         $notified_ts = array_slice($notified_ts, -200);
     }
     if (!empty($pending_notifs)) {
         $s['browser_notified_ts'] = $notified_ts;
         save_state($s);
+    }
+
+    // U1: include karat prices in API response
+    $display_aed   = (float)($s['live_display_aed'] ?? 0);
+    $karat_prices  = [];
+    if ($display_aed > 0) {
+        foreach (unserialize(KARAT_RATIOS) as $k => $r) {
+            $karat_prices[$k] = round($display_aed * $r, 2);
+        }
     }
 
     echo json_encode([
@@ -180,6 +183,8 @@ function serve_api(): void {
         'chart'               => $s['chart_history'] ?? [],
         'alerts'              => array_slice(array_reverse($s['alert_log'] ?? []), 0, ALERT_LOG_MAX),
         'pending_notifs'      => $pending_notifs,
+        'karat_prices'        => $karat_prices,
+        'live_tip'            => $s['live_tip'] ?? null,  // USD, converted client-side
     ], JSON_UNESCAPED_UNICODE);
 }
 
@@ -205,9 +210,7 @@ function notif_title(string $key): string {
 
 function notif_body(array $al): string {
     $msg = $al['msg'] ?? '';
-    // Strip markdown
     $msg = preg_replace('/[*_`]/', '', $msg);
-    // Take first 2 lines
     $lines = array_filter(explode("\n", $msg));
     $lines = array_values($lines);
     $body  = implode(' — ', array_slice($lines, 1, 2));
@@ -328,7 +331,7 @@ if ($is_new_day) {
         'pre_market_low_ts'     => $now,
         'day_low_prev'          => $gold_usd_oz,
         'day_low_reached'       => false,
-        'pm_support_alerted'    => false,   // E7
+        'pm_support_alerted'    => false,
         'consec_up'             => 0,
         'signals_today'         => 0,
         'gold_price_hist'       => [$gold_usd_oz],
@@ -336,9 +339,11 @@ if ($is_new_day) {
         'ema_slow_val'          => null,
         'ema_cross_bullish'     => false,
         'alert_log'             => [],
-        'alert_log_keys_today'  => [],      // E4: dedup set
+        'alert_log_keys_today'  => [],
         'browser_notified_ts'   => [],
         'chart_history'         => [['ts' => $now, 'spot_aed' => $spot_aed, 'display_aed' => $display_aed]],
+        // U5: pooled signal conditions during cooldown
+        'signal_pool'           => [],
     ]);
     log_msg("New day reset. Open=" . fmt_aed($display_aed));
 }
@@ -436,11 +441,9 @@ $orb_set    = (bool)($state['orb_set']    ?? false);
 $orb_broken = (bool)($state['orb_broken'] ?? false);
 
 // ── E4: alert dedup helper ────────────────────────────────────────
-// Tracks key+date to prevent same signal repeating on same calendar day
 $alert_log_keys_today = (array)($state['alert_log_keys_today'] ?? []);
 function alert_not_duped(string $key, array &$keys_today): bool {
     $dk = $key . '_' . date('Y-m-d');
-    // For signals with own cooldown management (day_low, dxy_weak) we only gate once per day
     $once_per_day = ['dxy_weak', 'orb'];
     if (in_array($key, $once_per_day) && in_array($dk, $keys_today)) return false;
     return true;
@@ -448,6 +451,40 @@ function alert_not_duped(string $key, array &$keys_today): bool {
 function mark_alert_duped(string $key, array &$keys_today): void {
     $dk = $key . '_' . date('Y-m-d');
     if (!in_array($dk, $keys_today)) $keys_today[] = $dk;
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  U5: Signal Pooling — track worst-case condition during cooldown
+//  For each signal key, we store the worst (most extreme) parameter
+//  observed while the cooldown was active.  After cooldown expires,
+//  if a pooled condition is present AND still valid, fire immediately.
+// ══════════════════════════════════════════════════════════════════
+
+$signal_pool = (array)($state['signal_pool'] ?? []);
+
+/**
+ * Pool a condition value observed while a signal is on cooldown.
+ * $extremeFn: 'min' or 'max' — which direction is "worse" (more triggering).
+ */
+function pool_signal(array &$pool, string $key, float $val, string $extremeFn = 'min'): void {
+    if (!isset($pool[$key])) {
+        $pool[$key] = ['val' => $val, 'ts' => time()];
+    } else {
+        $cur = (float)$pool[$key]['val'];
+        $pool[$key]['val'] = ($extremeFn === 'min') ? min($cur, $val) : max($cur, $val);
+        $pool[$key]['ts']  = time();
+    }
+}
+function consume_pool(array &$pool, string $key): ?float {
+    if (!isset($pool[$key])) return null;
+    $val = (float)$pool[$key]['val'];
+    unset($pool[$key]);
+    return $val;
+}
+function pool_has(array $pool, string $key): bool {
+    // Only valid if pooled within last 4 hours (stale guard)
+    if (!isset($pool[$key])) return false;
+    return (time() - (int)($pool[$key]['ts'] ?? 0)) < 14400;
 }
 
 // ── Step 4: Day-low alert ─────────────────────────────────────────
@@ -458,63 +495,146 @@ $pm_low_val    = (float)($state['pre_market_low'] ?? $prev_day_low);
 $low_reference = ($in_hours && $pm_set_early) ? min($pm_low_val, $prev_day_low) : $prev_day_low;
 $low_drop_pct  = pct_change($low_reference, $gold_usd_oz);
 
-if ($day_chg < -0.10
-    && $gold_usd_oz < $low_reference
-    && abs($low_drop_pct) >= DAY_LOW_MIN_DROP_PCT
-    && cooldown_ok($state, 'day_low', COOLDOWN_DAY_LOW, $now)
-) {
-    $ref_label = ($in_hours && $pm_set_early && $gold_usd_oz < $pm_low_val)
-                  ? "pre-market floor" : "previous low";
-    $alerts[] = [
-        'key'  => 'day_low',
-        'text' => "🔴 *NEW SESSION LOW*\n"
-                . "`" . fmt_aed($display_aed) . "` — " . fmt_chg($day_chg) . " from open\n"
-                . "_(broke " . number_format(abs($low_drop_pct), 2) . "% below {$ref_label})_",
-    ];
-    $state['day_low_prev']    = $gold_usd_oz;
-    $state['day_low_reached'] = true;
-    if ($in_hours && $pm_set_early) {
-        $state['pre_market_low'] = min($pm_low_val, $gold_usd_oz);
+$day_low_cd_ok = cooldown_ok($state, 'day_low', COOLDOWN_DAY_LOW, $now);
+
+if ($day_chg < -0.10 && $gold_usd_oz < $low_reference && abs($low_drop_pct) >= DAY_LOW_MIN_DROP_PCT) {
+    if ($day_low_cd_ok) {
+        // U5: also check if pooled condition is worse; use pooled low_drop if so
+        $pooled = pool_has($signal_pool, 'day_low')
+                    ? consume_pool($signal_pool, 'day_low')
+                    : null;
+        $effective_drop = ($pooled !== null && abs($pooled) > abs($low_drop_pct))
+                            ? $pooled : $low_drop_pct;
+        $ref_label = ($in_hours && $pm_set_early && $gold_usd_oz < $pm_low_val)
+                      ? "pre-market floor" : "previous low";
+        $alerts[] = [
+            'key'  => 'day_low',
+            'text' => "🔴 *NEW SESSION LOW*\n"
+                    . "`" . fmt_aed($display_aed) . "` — " . fmt_chg($day_chg) . " from open\n"
+                    . "_(broke " . number_format(abs($effective_drop), 2) . "% below {$ref_label})_",
+        ];
+        $state['day_low_prev']    = $gold_usd_oz;
+        $state['day_low_reached'] = true;
+        if ($in_hours && $pm_set_early) {
+            $state['pre_market_low'] = min($pm_low_val, $gold_usd_oz);
+        }
+    } else {
+        // Cooldown active — pool the worst drop seen
+        pool_signal($signal_pool, 'day_low', $low_drop_pct, 'min');
+        log_msg("day_low pooled during cooldown: " . number_format($low_drop_pct, 2) . "%");
+    }
+}
+// U5: After cooldown, fire pooled day_low if not already handled above
+if ($day_low_cd_ok && pool_has($signal_pool, 'day_low') && !array_key_exists('day_low', array_column($alerts, 'key', 'key'))) {
+    $pooled = consume_pool($signal_pool, 'day_low');
+    if ($pooled !== null && abs($pooled) >= DAY_LOW_MIN_DROP_PCT) {
+        $alerts[] = [
+            'key'  => 'day_low',
+            'text' => "🔴 *SESSION LOW (post-cooldown)*\n"
+                    . "`" . fmt_aed($display_aed) . "` — pooled drop: " . number_format(abs($pooled), 2) . "%\n"
+                    . "_(alert delayed by cooldown — worst level reached was noted)_",
+        ];
+        $state['day_low_prev']    = $gold_usd_oz;
+        $state['day_low_reached'] = true;
     }
 }
 
 // ── Step 5: Bullish signals (active hours only) ───────────────────
 if ($in_hours) {
 
-    // ─ S1: DXY drop ──────────────────────────────────────────────
-    if ($dxy !== null && isset($state['prev_dxy']) && (float)$state['prev_dxy'] > 0) {
-        $d = pct_change((float)$state['prev_dxy'], $dxy);
-        if ($d <= -DXY_DROP_PCT && cooldown_ok($state, 'dxy_drop', COOLDOWN_MACRO, $now)) {
-            $alerts[] = ['key' => 'dxy_drop', 'text' =>
-                "💵 *DOLLAR WEAKENING*\n"
-                . "DXY " . number_format((float)$state['prev_dxy'], 2) . " → "
-                . number_format($dxy, 2) . " (" . dxy_label_plain($dxy) . ")\n"
-                . "Fell " . number_format(abs($d), 2) . "% — gold tailwind"];
+    // ── Helper: fire-or-pool for a signal ─────────────────────────
+    // Returns true if alert was fired (either now or pooled-then-fired).
+    // $condition: bool — is the trigger condition met right now?
+    // $cdKey / $cdMins: cooldown params
+    // $poolKey: key for pool storage
+    // $poolVal: float metric to track worst-case during cooldown
+    // $poolDir: 'min'|'max'
+    // $buildAlert: callable(float $effectiveVal): array — returns alert array or []
+    $fire_or_pool = function(
+        bool $condition,
+        string $cdKey, int $cdMins,
+        string $poolKey, float $poolVal, string $poolDir,
+        callable $buildAlert
+    ) use (&$alerts, &$state, &$signal_pool, $now): void {
+        $cd_ok = cooldown_ok($state, $cdKey, $cdMins, $now);
+
+        if ($condition) {
+            if ($cd_ok) {
+                // Also incorporate pooled worst-case
+                $pooled = pool_has($signal_pool, $poolKey)
+                            ? consume_pool($signal_pool, $poolKey)
+                            : null;
+                $effective = ($pooled !== null
+                    && (($poolDir === 'min' && $pooled < $poolVal)
+                        || ($poolDir === 'max' && $pooled > $poolVal)))
+                        ? $pooled : $poolVal;
+                $a = $buildAlert($effective);
+                if (!empty($a)) $alerts[] = $a;
+            } else {
+                pool_signal($signal_pool, $poolKey, $poolVal, $poolDir);
+            }
+        } elseif ($cd_ok && pool_has($signal_pool, $poolKey)) {
+            // Cooldown just expired; fire pooled condition if still relevant
+            $pooled = consume_pool($signal_pool, $poolKey);
+            if ($pooled !== null) {
+                $a = $buildAlert($pooled);
+                if (!empty($a)) $alerts[] = $a;
+            }
         }
+    };
+
+    // ─ S1: DXY drop ──────────────────────────────────────────────
+    $dxy_drop_val = 0.0;
+    if ($dxy !== null && isset($state['prev_dxy']) && (float)$state['prev_dxy'] > 0) {
+        $dxy_drop_val = pct_change((float)$state['prev_dxy'], $dxy);
     }
+    $fire_or_pool(
+        $dxy !== null && $dxy_drop_val <= -DXY_DROP_PCT,
+        'dxy_drop', COOLDOWN_MACRO,
+        'dxy_drop', $dxy_drop_val, 'min',
+        function(float $eff) use ($state, $dxy): array {
+            if ($dxy === null) return [];
+            return ['key' => 'dxy_drop', 'text' =>
+                "💵 *DOLLAR WEAKENING*\n"
+                . "DXY " . number_format((float)($state['prev_dxy'] ?? $dxy), 2) . " → "
+                . number_format($dxy, 2) . " (" . dxy_label_plain($dxy) . ")\n"
+                . "Fell " . number_format(abs($eff), 2) . "% — gold tailwind"];
+        }
+    );
 
     // ─ S2: TIP ETF rising ────────────────────────────────────────
+    $tip_rise_val = 0.0;
     if ($tip !== null && isset($state['prev_tip']) && (float)$state['prev_tip'] > 0) {
-        $t = pct_change((float)$state['prev_tip'], $tip);
-        if ($t >= TIP_RISE_PCT && cooldown_ok($state, 'tip_rise', COOLDOWN_MACRO, $now)) {
-            $alerts[] = ['key' => 'tip_rise', 'text' =>
-                "📉 *REAL YIELDS FALLING*\n"
-                . "TIP ETF +" . number_format($t, 2) . "% — inflation premium rising"];
-        }
+        $tip_rise_val = pct_change((float)$state['prev_tip'], $tip);
     }
+    $fire_or_pool(
+        $tip !== null && $tip_rise_val >= TIP_RISE_PCT,
+        'tip_rise', COOLDOWN_MACRO,
+        'tip_rise', $tip_rise_val, 'max',
+        function(float $eff) use ($tip): array {
+            if ($tip === null) return [];
+            return ['key' => 'tip_rise', 'text' =>
+                "📉 *REAL YIELDS FALLING*\n"
+                . "TIP ETF +" . number_format($eff, 2) . "% — inflation premium rising"];
+        }
+    );
 
     // ─ S3: Bounce off session low ─────────────────────────────────
-    if ($session_dipped && $session_low > 0 && $gold_usd_oz > $session_low) {
-        $bounce = pct_change($session_low, $gold_usd_oz);
-        if ($bounce >= BOUNCE_PCT && cooldown_ok($state, 'bounce', COOLDOWN_BOUNCE, $now)) {
-            $alerts[] = ['key' => 'bounce', 'text' =>
+    $bounce_val = ($session_dipped && $session_low > 0 && $gold_usd_oz > $session_low)
+                    ? pct_change($session_low, $gold_usd_oz) : 0.0;
+    $fire_or_pool(
+        $session_dipped && $bounce_val >= BOUNCE_PCT,
+        'bounce', COOLDOWN_BOUNCE,
+        'bounce', $bounce_val, 'max',
+        function(float $eff) use ($session_low, $session_dip_pct, $display_aed): array {
+            return ['key' => 'bounce', 'text' =>
                 "🎯 *BOUNCING OFF SESSION LOW*\n"
-                . "+" . number_format($bounce, 2) . "% recovery from `"
+                . "+" . number_format($eff, 2) . "% recovery from `"
                 . fmt_aed(spot_to_aed($session_low)) . "`\n"
                 . "(Session dipped " . number_format(abs($session_dip_pct), 2) . "%) — now `"
                 . fmt_aed($display_aed) . "`"];
         }
-    }
+    );
 
     // ─ S4: Consecutive up moves ───────────────────────────────────
     $consec = (int)($state['consec_up'] ?? 0);
@@ -522,14 +642,18 @@ if ($in_hours) {
         $was_at = ($consec >= CONSEC_UP_COUNT);
         $consec = ($gold_usd_oz > $prev) ? $consec + 1 : 0;
         $state['consec_up'] = $consec;
-        if ($consec === CONSEC_UP_COUNT && !$was_at
-            && $day_chg > -0.50
-            && cooldown_ok($state, 'consec_up', COOLDOWN_TREND, $now)
-        ) {
-            $alerts[] = ['key' => 'consec_up', 'text' =>
-                "📈 *TREND TURNING UP*\n"
-                . "{$consec} consecutive higher closes\n"
-                . "Now at `" . fmt_aed($display_aed) . "`"];
+        if ($consec === CONSEC_UP_COUNT && !$was_at && $day_chg > -0.50) {
+            $fire_or_pool(
+                true,
+                'consec_up', COOLDOWN_TREND,
+                'consec_up', (float)$consec, 'max',
+                function(float $eff) use ($consec, $display_aed): array {
+                    return ['key' => 'consec_up', 'text' =>
+                        "📈 *TREND TURNING UP*\n"
+                        . "{$consec} consecutive higher closes\n"
+                        . "Now at `" . fmt_aed($display_aed) . "`"];
+                }
+            );
         }
     } else {
         $state['consec_up'] = 0;
@@ -538,66 +662,88 @@ if ($in_hours) {
     // ─ S5: GLD volume spike on up candle ──────────────────────────
     if ($gld_vol !== null && $gld_avg !== null && $gld_avg > 0 && $prev !== null) {
         $vm = $gld_vol / $gld_avg;
-        if ($vm >= GLD_VOL_MULT && $gold_usd_oz > $prev
-            && cooldown_ok($state, 'gld_vol', COOLDOWN_VOLUME, $now)
-        ) {
-            $alerts[] = ['key' => 'gld_vol', 'text' =>
-                "🏦 *INSTITUTIONAL BUYING*\n"
-                . "GLD volume " . number_format($vm, 1) . "× average on rising candle\n"
-                . "Strong accumulation signal at `" . fmt_aed($display_aed) . "`"];
-        }
+        $fire_or_pool(
+            $vm >= GLD_VOL_MULT && $gold_usd_oz > $prev,
+            'gld_vol', COOLDOWN_VOLUME,
+            'gld_vol', $vm, 'max',
+            function(float $eff) use ($display_aed): array {
+                return ['key' => 'gld_vol', 'text' =>
+                    "🏦 *INSTITUTIONAL BUYING*\n"
+                    . "GLD volume " . number_format($eff, 1) . "× average on rising candle\n"
+                    . "Strong accumulation signal at `" . fmt_aed($display_aed) . "`"];
+            }
+        );
     }
 
     // ─ S6: Deep dip recovery ──────────────────────────────────────
-    if ($session_dipped && $day_chg <= -DEEP_DIP_PCT && $session_low > 0 && $gold_usd_oz > $session_low) {
-        $bfl = pct_change($session_low, $gold_usd_oz);
-        if ($bfl >= DEEP_DIP_BOUNCE_PCT && cooldown_ok($state, 'deep_dip', COOLDOWN_DEEP_DIP, $now)) {
-            $alerts[] = ['key' => 'deep_dip', 'text' =>
+    $bfl = ($session_dipped && $session_low > 0 && $gold_usd_oz > $session_low)
+            ? pct_change($session_low, $gold_usd_oz) : 0.0;
+    $fire_or_pool(
+        $session_dipped && $day_chg <= -DEEP_DIP_PCT && $bfl >= DEEP_DIP_BOUNCE_PCT,
+        'deep_dip', COOLDOWN_DEEP_DIP,
+        'deep_dip', $day_chg, 'min',
+        function(float $eff) use ($session_low, $bfl, $display_aed, $day_chg): array {
+            return ['key' => 'deep_dip', 'text' =>
                 "💎 *DEEP DIP RECOVERY*\n"
                 . "Down " . number_format(abs($day_chg), 2) . "% today — bouncing +"
                 . number_format($bfl, 2) . "% off low\n"
-                . "`" . fmt_aed(spot_to_aed($session_low)) . "` → `" . fmt_aed($display_aed) . "`\n"
+                . "`" . fmt_aed(spot_to_aed($GLOBALS['session_low'] ?? 0)) . "` → `" . fmt_aed($display_aed) . "`\n"
                 . "_Potential buy zone_"];
         }
-    }
+    );
 
     // ─ S7: Oversold snap ──────────────────────────────────────────
     if (count($price_hist) >= OVERSOLD_WINDOW + 1 && $prev !== null && $gold_usd_oz > $prev) {
         $ws    = array_slice($price_hist, -(OVERSOLD_WINDOW + 1));
         $wdrop = pct_change((float)$ws[0], (float)min($ws));
-        if ($wdrop <= -OVERSOLD_DROP_PCT && $gold_usd_oz > (float)min($ws)
-            && cooldown_ok($state, 'oversold', COOLDOWN_OVERSOLD, $now)
-        ) {
-            $alerts[] = ['key' => 'oversold', 'text' =>
-                "⚡ *OVERSOLD SNAP*\n"
-                . "Fell " . number_format(abs($wdrop), 2) . "% in last " . OVERSOLD_WINDOW . " mins — reversing\n"
-                . "Early buy signal at `" . fmt_aed($display_aed) . "`"];
-        }
+        $fire_or_pool(
+            $wdrop <= -OVERSOLD_DROP_PCT && $gold_usd_oz > (float)min($ws),
+            'oversold', COOLDOWN_OVERSOLD,
+            'oversold', $wdrop, 'min',
+            function(float $eff) use ($display_aed): array {
+                return ['key' => 'oversold', 'text' =>
+                    "⚡ *OVERSOLD SNAP*\n"
+                    . "Fell " . number_format(abs($eff), 2) . "% in last " . OVERSOLD_WINDOW . " mins — reversing\n"
+                    . "Early buy signal at `" . fmt_aed($display_aed) . "`"];
+            }
+        );
     }
 
     // ─ S8: Structural DXY weakness ────────────────────────────────
     if ($dxy !== null && $dxy < DXY_WEAK_LEVEL
         && alert_not_duped('dxy_weak', $alert_log_keys_today)
-        && cooldown_ok($state, 'dxy_weak', COOLDOWN_DXY_WEAK, $now)
     ) {
-        $alerts[] = ['key' => 'dxy_weak', 'text' =>
-            "🌍 *DOLLAR BELOW 100*\n"
-            . "DXY " . number_format($dxy, 2) . " — structurally weak dollar\n"
-            . "Gold historically outperforms when DXY < 100"];
+        $fire_or_pool(
+            true,
+            'dxy_weak', COOLDOWN_DXY_WEAK,
+            'dxy_weak', $dxy, 'min',
+            function(float $eff) use ($dxy): array {
+                return ['key' => 'dxy_weak', 'text' =>
+                    "🌍 *DOLLAR BELOW 100*\n"
+                    . "DXY " . number_format($dxy, 2) . " — structurally weak dollar\n"
+                    . "Gold historically outperforms when DXY < 100"];
+            }
+        );
         mark_alert_duped('dxy_weak', $alert_log_keys_today);
     }
 
     // ─ S9: Opening Range Breakout ─────────────────────────────────
-    if ($orb_set && !$orb_broken && $orb_high !== null && $gold_usd_oz > $orb_high
+    if ($orb_set && !$orb_broken && $orb_high !== null
         && alert_not_duped('orb', $alert_log_keys_today)
-        && cooldown_ok($state, 'orb', COOLDOWN_ORB, $now)
     ) {
-        $break_pct = pct_change($orb_high, $gold_usd_oz);
-        $alerts[] = ['key' => 'orb', 'text' =>
-            "🚀 *OPENING RANGE BREAKOUT*\n"
-            . "Price broke above 30-min ORB high `" . fmt_aed(spot_to_aed($orb_high)) . "`\n"
-            . "+" . number_format($break_pct, 2) . "% above range — bullish continuation"];
-        $state['orb_broken'] = true;
+        $break_pct = ($gold_usd_oz > $orb_high) ? pct_change($orb_high, $gold_usd_oz) : 0.0;
+        $fire_or_pool(
+            $gold_usd_oz > $orb_high,
+            'orb', COOLDOWN_ORB,
+            'orb', $break_pct, 'max',
+            function(float $eff) use ($orb_high, &$state): array {
+                $state['orb_broken'] = true;
+                return ['key' => 'orb', 'text' =>
+                    "🚀 *OPENING RANGE BREAKOUT*\n"
+                    . "Price broke above 30-min ORB high `" . fmt_aed(spot_to_aed($orb_high)) . "`\n"
+                    . "+" . number_format($eff, 2) . "% above range — bullish continuation"];
+            }
+        );
         mark_alert_duped('orb', $alert_log_keys_today);
     }
 
@@ -607,67 +753,78 @@ if ($in_hours) {
         && $prev_ema_fast <= $prev_ema_slow
         && $ema_fast > $ema_slow
         && $gold_usd_oz > $prev
-        && cooldown_ok($state, 'ema_cross', COOLDOWN_EMA_CROSS, $now)
     ) {
-        $alerts[] = ['key' => 'ema_cross', 'text' =>
-            "✨ *MOMENTUM CROSSOVER*\n"
-            . "Fast EMA(" . EMA_FAST . ") crossed above Slow EMA(" . EMA_SLOW . ")\n"
-            . "Short-term momentum turning bullish at `" . fmt_aed($display_aed) . "`"];
+        $fire_or_pool(
+            true,
+            'ema_cross', COOLDOWN_EMA_CROSS,
+            'ema_cross', $ema_fast - $ema_slow, 'max',
+            function(float $eff) use ($display_aed): array {
+                return ['key' => 'ema_cross', 'text' =>
+                    "✨ *MOMENTUM CROSSOVER*\n"
+                    . "Fast EMA(" . EMA_FAST . ") crossed above Slow EMA(" . EMA_SLOW . ")\n"
+                    . "Short-term momentum turning bullish at `" . fmt_aed($display_aed) . "`"];
+            }
+        );
     }
 
     // ─ S11: Macro Confluence ─────────────────────────────────────
-    $dxy_drop_now = ($dxy !== null && isset($state['prev_dxy']) && (float)$state['prev_dxy'] > 0)
-                    ? pct_change((float)$state['prev_dxy'], $dxy) : 0;
-    $tip_rise_now = ($tip !== null && isset($state['prev_tip']) && (float)$state['prev_tip'] > 0)
-                    ? pct_change((float)$state['prev_tip'], $tip) : 0;
-    if ($dxy_drop_now <= -MACRO_CONF_DXY_DROP && $tip_rise_now >= MACRO_CONF_TIP_RISE
-        && cooldown_ok($state, 'macro_conf', COOLDOWN_MACRO_CONF, $now)
-    ) {
-        $alerts[] = ['key' => 'macro_conf', 'text' =>
-            "🎪 *MACRO CONFLUENCE*\n"
-            . "DXY ↓" . number_format(abs($dxy_drop_now), 2)
-            . "% AND TIP ↑" . number_format($tip_rise_now, 2) . "% simultaneously\n"
-            . "Both macro tailwinds aligning — high-confidence gold setup at `" . fmt_aed($display_aed) . "`"];
-    }
-
-    // ─ S12 (E6): Price Channel Break ─────────────────────────────
-    // Fires when price rises above the highest point in recent N runs (resistance break)
-    if (count($price_hist) >= CHANNEL_BREAK_WINDOW + 1 && $prev !== null && $gold_usd_oz > $prev) {
-        $window = array_slice($price_hist, -(CHANNEL_BREAK_WINDOW + 1), CHANNEL_BREAK_WINDOW);
-        $resistance = max($window);
-        if ($gold_usd_oz > $resistance
-            && pct_change($resistance, $gold_usd_oz) >= 0.10  // at least 0.1% break
-            && cooldown_ok($state, 'channel_break', COOLDOWN_CHANNEL_BREAK, $now)
-        ) {
-            $break_p = pct_change($resistance, $gold_usd_oz);
-            $alerts[] = ['key' => 'channel_break', 'text' =>
-                "📐 *RESISTANCE BROKEN*\n"
-                . "Price cleared " . CHANNEL_BREAK_WINDOW . "-min high `" . fmt_aed(spot_to_aed($resistance)) . "`\n"
-                . "+" . number_format($break_p, 2) . "% breakout — momentum continuing at `" . fmt_aed($display_aed) . "`"];
+    $dxy_drop_now = $dxy_drop_val;
+    $tip_rise_now = $tip_rise_val;
+    $fire_or_pool(
+        $dxy_drop_now <= -MACRO_CONF_DXY_DROP && $tip_rise_now >= MACRO_CONF_TIP_RISE,
+        'macro_conf', COOLDOWN_MACRO_CONF,
+        'macro_conf', $dxy_drop_now, 'min',
+        function(float $eff) use ($dxy_drop_now, $tip_rise_now, $display_aed): array {
+            return ['key' => 'macro_conf', 'text' =>
+                "🎪 *MACRO CONFLUENCE*\n"
+                . "DXY ↓" . number_format(abs($dxy_drop_now), 2)
+                . "% AND TIP ↑" . number_format($tip_rise_now, 2) . "% simultaneously\n"
+                . "Both macro tailwinds aligning — high-confidence gold setup at `" . fmt_aed($display_aed) . "`"];
         }
+    );
+
+    // ─ S12: Price Channel Break ──────────────────────────────────
+    if (count($price_hist) >= CHANNEL_BREAK_WINDOW + 1 && $prev !== null && $gold_usd_oz > $prev) {
+        $window     = array_slice($price_hist, -(CHANNEL_BREAK_WINDOW + 1), CHANNEL_BREAK_WINDOW);
+        $resistance = max($window);
+        $break_p    = pct_change($resistance, $gold_usd_oz);
+        $fire_or_pool(
+            $gold_usd_oz > $resistance && $break_p >= 0.10,
+            'channel_break', COOLDOWN_CHANNEL_BREAK,
+            'channel_break', $break_p, 'max',
+            function(float $eff) use ($resistance, $display_aed): array {
+                return ['key' => 'channel_break', 'text' =>
+                    "📐 *RESISTANCE BROKEN*\n"
+                    . "Price cleared " . CHANNEL_BREAK_WINDOW . "-min high `" . fmt_aed(spot_to_aed($resistance)) . "`\n"
+                    . "+" . number_format($eff, 2) . "% breakout — momentum continuing at `" . fmt_aed($display_aed) . "`"];
+            }
+        );
     }
 
-    // ─ S13 (E7): Pre-Market Support Approach ─────────────────────
-    // Early warning: price approaching pre-market low during session (potential bounce zone)
+    // ─ S13: Pre-Market Support Approach ──────────────────────────
     $pm_low_support = (float)($state['pre_market_low'] ?? 0);
     if ($pm_low_support > 0 && $day_chg < -0.20) {
-        $dist_pct = pct_change($pm_low_support, $gold_usd_oz); // negative = approaching
-        if ($dist_pct <= 0 && $dist_pct >= -(PM_SUPPORT_PCT)  // within X% above support
-            && !($state['pm_support_alerted'] ?? false)
-            && cooldown_ok($state, 'pm_support', COOLDOWN_PM_SUPPORT, $now)
-        ) {
-            $alerts[] = ['key' => 'pm_support', 'text' =>
-                "🛡️ *APPROACHING SUPPORT*\n"
-                . "Price near pre-market low `" . fmt_aed(spot_to_aed($pm_low_support)) . "`\n"
-                . "Strong support zone — watch for bounce. Now at `" . fmt_aed($display_aed) . "`"];
-            $state['pm_support_alerted'] = true;
-        }
-        // Reset arm once price moves away from support (> 0.5% above)
+        $dist_pct = pct_change($pm_low_support, $gold_usd_oz);
+        $fire_or_pool(
+            $dist_pct <= 0 && $dist_pct >= -PM_SUPPORT_PCT && !($state['pm_support_alerted'] ?? false),
+            'pm_support', COOLDOWN_PM_SUPPORT,
+            'pm_support', $dist_pct, 'min',
+            function(float $eff) use ($pm_low_support, $display_aed, &$state): array {
+                $state['pm_support_alerted'] = true;
+                return ['key' => 'pm_support', 'text' =>
+                    "🛡️ *APPROACHING SUPPORT*\n"
+                    . "Price near pre-market low `" . fmt_aed(spot_to_aed($pm_low_support)) . "`\n"
+                    . "Strong support zone — watch for bounce. Now at `" . fmt_aed($display_aed) . "`"];
+            }
+        );
         if ($dist_pct > 0.50) {
             $state['pm_support_alerted'] = false;
         }
     }
 }
+
+// Save updated signal pool
+$state['signal_pool'] = $signal_pool;
 
 // ── Step 6: Rolling state ─────────────────────────────────────────
 if ($gld_vol !== null) {
@@ -694,7 +851,7 @@ foreach ($alerts as $a) {
 if (!empty($alerts)) {
     $consec_val = (int)($state['consec_up'] ?? 0);
     $consec_str = $consec_val > 0 ? "{$consec_val}↑ in a row" : "—";
-    $from_low   = ($session_dipped && $session_low > 0 && $gold_usd_oz > $session_low)
+    $from_low   = ($session_dipped && $session_low > 0 && $session_low < $gold_usd_oz)
                     ? pct_change($session_low, $gold_usd_oz) : 0;
     $bounce_str = $from_low >= 0.05 ? "+" . number_format($from_low, 2) . "%" : "—";
 
@@ -715,7 +872,6 @@ if (!empty($alerts)) {
     foreach ($alerts as $a) {
         $msg .= $a['text'] . "\n\n";
         $state['last_alert'][$a['key']] = $now;
-        // E4: build a dedup key for the alert log (key + minute-level ts)
         $dedup_key = $a['key'] . '_' . floor($now / 60);
         $already_in_log = false;
         foreach ($alert_log as $existing) {
@@ -865,7 +1021,6 @@ function fetch_igold_price(): ?float {
 }
 
 function invalidate_crumb_and_reauth(): array|false {
-    // E5: reload fresh state before saving to avoid race condition
     $state = load_state();
     unset($state['yf_crumb'], $state['yf_crumb_ts']);
     save_state($state);
@@ -876,7 +1031,6 @@ function invalidate_crumb_and_reauth(): array|false {
 
 function get_yahoo_auth(): array|false {
     $jar   = COOKIE_FILE;
-    // E5: always reload state for freshest crumb
     $state = load_state();
     $cc    = $state['yf_crumb']    ?? '';
     $cat   = (int)($state['yf_crumb_ts'] ?? 0);
@@ -974,7 +1128,6 @@ function get_yahoo_auth(): array|false {
         return false;
     }
 
-    // E5: reload state before saving crumb to avoid clobbering concurrent writes
     $state = load_state();
     $state['yf_crumb']    = $crumb;
     $state['yf_crumb_ts'] = time();
@@ -1163,13 +1316,23 @@ function render_dashboard(): void {
     $age_secs      = $last_run > 0 ? (time() - $last_run) : null;
     $age_str       = $age_secs !== null
                         ? ($age_secs < 120 ? $age_secs . 's ago' : round($age_secs / 60) . 'm ago') : '—';
-    $dxy_color     = $dxy === null ? '#6b7280'
+    $dxy_color_dark  = $dxy === null ? '#6b7280'
                         : ($dxy < 100 ? '#22c55e' : ($dxy < 103 ? '#eab308' : '#ef4444'));
+    $dxy_color_light = $dxy === null ? '#6b7280'
+                        : ($dxy < 100 ? '#16a34a' : ($dxy < 103 ? '#b45309' : '#dc2626'));
     $now           = time();
 
-    // Retail vs spot markup note
-    $markup_pct    = ($spot_aed > 0 && $display_aed > 0)
-                        ? round(pct_change($spot_aed, $display_aed), 2) : 0;
+    // U1: karat prices
+    $karat_ratios  = unserialize(KARAT_RATIOS);
+    $karat_prices  = [];
+    if ($display_aed > 0) {
+        foreach ($karat_ratios as $k => $r) {
+            $karat_prices[$k] = round($display_aed * $r, 2);
+        }
+    }
+
+    // TIP in AED
+    $tip_aed       = $tip !== null ? round($tip * USD_TO_AED, 2) : null;
 
     // Low status badge
     if ($low_reached) {
@@ -1181,36 +1344,36 @@ function render_dashboard(): void {
         $low_status = "<span class='badge b-neu'>✅ Above floor</span>";
     }
 
-    // ── Signal metadata with plain English tooltips ───────────────
+    // ── Signal metadata ───────────────────────────────────────────
     $signal_meta = [
-        'day_low'       => ['🔴', 'Session Low',   'bear',
+        'day_low'       => ['🔴', 'Session Low',      'bear',
             "Price has just dropped to a NEW LOW for today's trading session. This is important — it means gold is cheaper than at any other point today. Watch closely: if it stops falling and starts to recover, that can be a good buying opportunity."],
-        'dxy_drop'      => ['💵', 'Dollar Weakens', 'bull',
+        'dxy_drop'      => ['💵', 'Dollar Weakens',   'bull',
             "The US Dollar just weakened. Gold and the dollar usually move in opposite directions — when the dollar falls, gold tends to rise. Think of it like a seesaw: dollar down = gold up. This is a positive sign for gold buyers."],
-        'tip_rise'      => ['📉', 'Yields Falling', 'bull',
+        'tip_rise'      => ['📉', 'Yields Falling',   'bull',
             "A key bond market indicator (TIP ETF) is rising, which means real interest rates are falling. When rates fall, gold becomes more attractive because cash in the bank earns less. This historically pushes gold prices higher."],
-        'bounce'        => ['🎯', 'Bounce Off Low',  'bull',
-            "Gold dipped earlier today and is now bouncing back up from its lowest point. This bounce pattern suggests buyers are stepping in at the low price — exactly the dip-buying opportunity we look for. The bigger the dip before this, the more significant the bounce."],
+        'bounce'        => ['🎯', 'Bounce Off Low',   'bull',
+            "Gold dipped earlier today and is now bouncing back up from its lowest point. This bounce pattern suggests buyers are stepping in at the low price — exactly the dip-buying opportunity we look for."],
         'consec_up'     => ['📈', 'Uptrend Building', 'bull',
             "Gold has risen in " . CONSEC_UP_COUNT . " consecutive one-minute intervals. This steady, consistent upward movement suggests buying momentum is building — not just a random blip but a developing trend."],
         'gld_vol'       => ['🏦', 'Big Money Buying', 'bull',
-            "The GLD gold ETF (a large fund that tracks gold) is seeing 2× or more its normal trading volume while prices are rising. This means big institutional investors and funds are actively buying — a very strong signal that professionals see value here."],
-        'deep_dip'      => ['💎', 'Deep Dip Recovery', 'bull',
-            "Gold fell sharply (2%+ in one day) and is now starting to recover from its lowest point. Sharp dips followed by recovery are often the best buying opportunities — you're catching gold near its daily bottom. The '💎 hands' emoji is intentional: this is where patient buyers are rewarded."],
+            "The GLD gold ETF is seeing 2× or more its normal trading volume while prices are rising. This means big institutional investors and funds are actively buying — a very strong signal that professionals see value here."],
+        'deep_dip'      => ['💎', 'Deep Dip Recovery','bull',
+            "Gold fell sharply (2%+ in one day) and is now starting to recover. Sharp dips followed by recovery are often the best buying opportunities — you're catching gold near its daily bottom."],
         'oversold'      => ['⚡', 'Quick Reversal',   'bull',
-            "Gold dropped quickly in the last few minutes (1.5%+) and has just started moving back up. When something falls too fast, it often snaps back. This 'oversold snap' is an early signal that the mini-selloff may be ending — an early warning before a bigger bounce."],
+            "Gold dropped quickly in the last few minutes (1.5%+) and has just started moving back up. When something falls too fast, it often snaps back. This is an early signal that the mini-selloff may be ending."],
         'dxy_weak'      => ['🌍', 'Dollar Below 100', 'bull',
-            "The US Dollar Index has fallen below 100 — a psychologically important level. Historically, when the dollar stays this weak, gold performs well over the following weeks and months. This is more of a background condition than a precise entry signal, but it's a positive environment for gold."],
+            "The US Dollar Index has fallen below 100 — a psychologically important level. Historically, when the dollar stays this weak, gold performs well over the following weeks and months."],
         'orb'           => ['🚀', 'Breakout Signal',  'bull',
-            "In the first 30 minutes of trading, gold established a price range. It has now broken ABOVE the top of that range. This 'Opening Range Breakout' is used by professional traders as a signal that the direction for the rest of the day is likely upward."],
-        'ema_cross'     => ['✨', 'Momentum Crossover', 'bull',
-            "A short-term average price (last 5 minutes) has crossed above a longer-term average (last 20 minutes). This 'golden cross' pattern means short-term momentum has turned bullish. Think of it like a fast-moving vehicle overtaking a slower one — the short-term trend is now stronger."],
-        'macro_conf'    => ['🎪', 'All Stars Aligning', 'bull',
-            "Both major gold-positive signals fired at the same time: the US Dollar weakened AND bond market indicators turned gold-bullish simultaneously. When multiple unrelated factors all point in the same direction, it's called 'confluence' — and it's one of the highest-confidence signals we track."],
-        'channel_break' => ['📐', 'Resistance Broken', 'bull',
-            "Gold has just broken above a price ceiling it struggled to get past in the last 15 minutes. Traders call this 'breaking resistance' — once a ceiling becomes a floor, prices can continue rising. This suggests the recent mini-rally has genuine momentum behind it."],
-        'pm_support'    => ['🛡️', 'Support Zone Nearby', 'bull',
-            "Gold is approaching the pre-market low — the lowest price from overnight trading. This level often acts as 'support' because buyers who set orders overnight will step in here. It's a potential bounce zone — watch for a reversal. If it holds, it's a good sign."],
+            "In the first 30 minutes of trading, gold established a price range. It has now broken ABOVE the top of that range — a signal that the direction for the rest of the day is likely upward."],
+        'ema_cross'     => ['✨', 'Momentum Cross',   'bull',
+            "A short-term average price (last 5 minutes) has crossed above a longer-term average (last 20 minutes). This 'golden cross' pattern means short-term momentum has turned bullish."],
+        'macro_conf'    => ['🎪', 'All Stars Aligning','bull',
+            "Both major gold-positive signals fired at the same time: the US Dollar weakened AND bond market indicators turned gold-bullish simultaneously. When multiple unrelated factors all point in the same direction, it's called 'confluence' — highest confidence."],
+        'channel_break' => ['📐', 'Resistance Broken','bull',
+            "Gold has just broken above a price ceiling it struggled to get past in the last 15 minutes. Once a ceiling becomes a floor, prices can continue rising. This suggests genuine momentum."],
+        'pm_support'    => ['🛡️', 'Support Zone',     'bull',
+            "Gold is approaching the pre-market low — the lowest price from overnight trading. This level often acts as 'support' because buyers who set orders overnight will step in here."],
     ];
 
     $cooldowns = [
@@ -1230,15 +1393,28 @@ function render_dashboard(): void {
         'pm_support'    => COOLDOWN_PM_SUPPORT,
     ];
     $last_alerts    = $s['last_alert'] ?? [];
+    $signal_pool_st = $s['signal_pool'] ?? [];
+
     $seed_json      = json_encode([
         'chart'  => array_values($s['chart_history'] ?? []),
         'alerts' => array_slice(array_reverse($s['alert_log'] ?? []), 0, ALERT_LOG_MAX),
     ], JSON_UNESCAPED_UNICODE);
 
+    // U3: currency rates vs AED
+    $currency_rates = [
+        'AED' => 1.0,
+        'USD' => 1 / USD_TO_AED,
+        'INR' => 22.68,   // approx AED→INR
+        'PKR' => 76.50,   // approx AED→PKR
+    ];
+    $currency_symbols = ['AED' => 'AED', 'USD' => '$', 'INR' => '₹', 'PKR' => '₨'];
+    $currencies_json  = json_encode($currency_rates);
+    $symbols_json     = json_encode($currency_symbols);
+
     header('Content-Type: text/html; charset=utf-8');
 ?>
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1246,54 +1422,128 @@ function render_dashboard(): void {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&family=Geist:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
-:root {
+/* ══════════════════════════════════════════════════════════════
+   THEME TOKENS — dark (default) + light override
+   ══════════════════════════════════════════════════════════════ */
+:root,
+[data-theme="dark"] {
   --bg:#09090b; --surface:#111113; --surface2:#17171a; --surface3:#1e1e23;
   --border:#222228; --border2:#2d2d38;
   --gold:#d4a843; --gold2:#f0c560; --gold3:#fbd97a; --gold-dim:#7a5e1e;
   --text:#e8e8ec; --muted:#6b6b7a; --muted2:#44444f;
   --green:#22c55e; --red:#ef4444; --yellow:#eab308; --blue:#60a5fa;
   --r:12px; --rs:8px; --rxs:5px;
+  /* tooltip semi-transparent */
+  --tt-bg:rgba(20,20,26,0.88);
+  --tt-border:rgba(45,45,56,0.85);
+  --chart-grid:rgba(34,34,40,0.5);
+  --shadow: 0 8px 32px rgba(0,0,0,.55);
+  --shadow-lg: 0 16px 56px rgba(0,0,0,.75);
+  --dxy-color: <?= $dxy_color_dark ?>;
+  --noise-opacity:.5;
 }
+
+[data-theme="light"] {
+  --bg:#f5f4f0; --surface:#ffffff; --surface2:#f0ede8; --surface3:#e8e4de;
+  --border:#ddd9d0; --border2:#c9c4b8;
+  --gold:#8a6520; --gold2:#a07828; --gold3:#bf9030; --gold-dim:#c8a84a;
+  --text:#1a1a1e; --muted:#6b6560; --muted2:#9c9890;
+  --green:#16a34a; --red:#dc2626; --yellow:#b45309; --blue:#2563eb;
+  --r:12px; --rs:8px; --rxs:5px;
+  --tt-bg:rgba(255,253,248,0.92);
+  --tt-border:rgba(180,172,158,0.75);
+  --chart-grid:rgba(200,196,188,0.45);
+  --shadow: 0 4px 16px rgba(0,0,0,.10);
+  --shadow-lg: 0 12px 36px rgba(0,0,0,.14);
+  --dxy-color: <?= $dxy_color_light ?>;
+  --noise-opacity:.15;
+}
+
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-body{background:var(--bg);color:var(--text);font-family:'Geist',sans-serif;min-height:100vh;line-height:1.5;-webkit-font-smoothing:antialiased;}
+body{background:var(--bg);color:var(--text);font-family:'Geist',sans-serif;min-height:100vh;line-height:1.5;-webkit-font-smoothing:antialiased;transition:background .3s,color .3s;}
 body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
-  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");opacity:.5;}
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");opacity:var(--noise-opacity);}
 .wrap{position:relative;z-index:1;max-width:1180px;margin:0 auto;padding:24px 16px 64px;}
 
-/* ── Header ── */
+/* ══ Header ══ */
 .hdr{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px;}
 .hdr-left h1{font-family:'Instrument Serif',serif;font-size:clamp(1.9rem,4vw,2.7rem);font-weight:400;letter-spacing:-.025em;
   background:linear-gradient(135deg,var(--gold3) 0%,var(--gold) 55%,var(--gold-dim) 100%);
   -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
 .hdr-left p{font-size:.7rem;color:var(--muted);margin-top:4px;letter-spacing:.08em;text-transform:uppercase;}
-.hdr-right{display:flex;align-items:flex-end;gap:12px;}
+.hdr-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .last-run{font-family:'DM Mono',monospace;font-size:.7rem;color:var(--muted);text-align:right;}
 .live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:5px;animation:pulse 2s ease-in-out infinite;}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.65)}}
 
-/* ── Bell / notification button ── */
-.bell-btn{display:flex;align-items:center;justify-content:center;width:38px;height:38px;
+/* ══ U4: Theme toggle ══ */
+.theme-toggle{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;padding:6px 10px;
+  background:var(--surface);border:1px solid var(--border);border-radius:99px;
+  font-size:.68rem;color:var(--muted);font-family:'Geist',sans-serif;font-weight:500;
+  transition:all .2s;white-space:nowrap;}
+.theme-toggle:hover{border-color:var(--gold-dim);color:var(--text);}
+.toggle-track{width:30px;height:16px;background:var(--surface3);border-radius:8px;
+  border:1px solid var(--border2);position:relative;flex-shrink:0;transition:background .25s;}
+.toggle-thumb{position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;
+  background:var(--muted);transition:transform .25s,background .25s;}
+[data-theme="light"] .toggle-thumb{transform:translateX(14px);background:var(--gold);}
+[data-theme="light"] .toggle-track{background:rgba(160,120,40,.15);border-color:var(--gold-dim);}
+.theme-toggle .icon-sun{display:none;}
+.theme-toggle .icon-moon{display:inline;}
+[data-theme="light"] .theme-toggle .icon-sun{display:inline;}
+[data-theme="light"] .theme-toggle .icon-moon{display:none;}
+
+/* ══ U3: Currency selector ══ */
+.currency-sel{position:relative;}
+.currency-btn{display:flex;align-items:center;gap:5px;padding:6px 10px;cursor:pointer;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--rs);
+  font-size:.72rem;font-weight:600;color:var(--gold);font-family:'DM Mono',monospace;
+  letter-spacing:.05em;transition:all .2s;white-space:nowrap;}
+.currency-btn:hover{border-color:var(--gold-dim);background:rgba(212,168,67,.07);}
+.currency-btn svg{opacity:.55;}
+.currency-drop{display:none;position:absolute;top:calc(100% + 6px);right:0;
+  background:var(--tt-bg);border:1px solid var(--tt-border);border-radius:var(--rs);
+  padding:5px;z-index:200;min-width:120px;
+  box-shadow:var(--shadow-lg);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}
+.currency-sel.open .currency-drop{display:block;}
+.currency-opt{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 11px;
+  border-radius:5px;cursor:pointer;font-size:.72rem;font-family:'DM Mono',monospace;
+  font-weight:500;color:var(--text);transition:background .15s;}
+.currency-opt:hover{background:rgba(212,168,67,.12);}
+.currency-opt.active{color:var(--gold);background:rgba(212,168,67,.08);}
+.currency-opt .co-sym{color:var(--muted);font-size:.64rem;}
+.currency-opt .co-chk{color:var(--gold);display:none;}
+.currency-opt.active .co-chk{display:inline;}
+
+/* ══ Bell / notification button ══ */
+.bell-btn{display:flex;align-items:center;justify-content:center;width:36px;height:36px;
   background:var(--surface);border:1px solid var(--border);border-radius:50%;cursor:pointer;
-  font-size:1rem;transition:all .2s;flex-shrink:0;position:relative;}
+  font-size:.95rem;transition:all .2s;flex-shrink:0;position:relative;}
 .bell-btn:hover{border-color:var(--gold-dim);background:rgba(212,168,67,.07);}
 .bell-btn.granted{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.06);}
 .bell-btn.denied{border-color:rgba(239,68,68,.3);opacity:.5;cursor:not-allowed;}
 .bell-badge{position:absolute;top:-3px;right:-3px;width:10px;height:10px;border-radius:50%;
   background:var(--red);border:2px solid var(--bg);display:none;}
 .bell-badge.show{display:block;}
-.bell-tip{position:absolute;bottom:calc(100% + 7px);right:0;background:var(--surface2);
-  border:1px solid var(--border2);border-radius:var(--rs);padding:7px 11px;
-  font-size:.68rem;color:var(--text);white-space:nowrap;display:none;z-index:100;
-  box-shadow:0 8px 24px rgba(0,0,0,.5);}
-.bell-btn:hover .bell-tip{display:block;}
 
-/* ── Toast notifications ── */
+/* ══ Semi-transparent tooltips (U6) ══ */
+/* Applied globally — all tooltips use --tt-bg / --tt-border */
+.generic-tip{
+  position:absolute;background:var(--tt-bg);border:1px solid var(--tt-border);
+  border-radius:var(--rs);padding:8px 12px;font-size:.68rem;color:var(--text);
+  white-space:nowrap;z-index:100;box-shadow:var(--shadow);
+  pointer-events:none;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+}
+
+/* ══ Toast notifications ══ */
 .toast-stack{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column-reverse;gap:8px;pointer-events:none;}
 .toast{background:var(--surface);border:1px solid var(--border2);border-radius:var(--r);
-  padding:13px 16px;font-size:.78rem;max-width:320px;box-shadow:0 12px 40px rgba(0,0,0,.7);
+  padding:13px 16px;font-size:.78rem;max-width:320px;box-shadow:var(--shadow-lg);
   pointer-events:all;animation:slideIn .3s ease;display:flex;gap:10px;align-items:flex-start;}
-.toast.bull{border-color:rgba(212,168,67,.35);background:linear-gradient(135deg,rgba(212,168,67,.08),var(--surface));}
-.toast.bear{border-color:rgba(239,68,68,.3);background:linear-gradient(135deg,rgba(239,68,68,.07),var(--surface));}
+.toast.bull{border-color:rgba(212,168,67,.35);background:var(--surface);}
+[data-theme="light"] .toast.bull{background:rgba(255,252,240,.97);}
+.toast.bear{border-color:rgba(239,68,68,.3);}
+[data-theme="light"] .toast.bear{background:rgba(255,248,248,.97);}
 .toast-icon{font-size:1.2rem;flex-shrink:0;line-height:1;}
 .toast-body{flex:1;}
 .toast-title{font-weight:600;color:var(--gold2);margin-bottom:2px;font-size:.75rem;}
@@ -1304,35 +1554,45 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 @keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
 @keyframes slideOut{from{opacity:1;transform:none}to{opacity:0;transform:translateX(20px)}}
 
-/* ── Cards ── */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;}
+/* ══ Cards ══ */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;transition:background .3s,border-color .3s;}
 .card-lbl{font-size:.63rem;font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px;}
 .card-lbl .dot{width:4px;height:4px;border-radius:50%;background:var(--gold-dim);flex-shrink:0;}
 .mb12{margin-bottom:12px;}
 .g3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px;}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;}
 
-/* ── Hero ── */
-.hero{background:linear-gradient(145deg,#130f08 0%,#0e0e11 60%,#0a0a0d 100%);border-color:var(--gold-dim);padding:28px 24px;position:relative;overflow:hidden;}
-.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 60% 80% at 90% 50%,rgba(212,168,67,.07) 0%,transparent 70%);pointer-events:none;}
+/* ══ Hero ══ */
+.hero{background:var(--surface);border-color:var(--gold-dim);padding:28px 24px;position:relative;overflow:hidden;}
+[data-theme="dark"] .hero{background:linear-gradient(145deg,#130f08 0%,#0e0e11 60%,#0a0a0d 100%);}
+[data-theme="light"] .hero{background:linear-gradient(145deg,#fffaf0 0%,#fdf8ef 60%,#f8f4e8 100%);}
+.hero::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse 60% 80% at 90% 50%,rgba(212,168,67,.08) 0%,transparent 70%);pointer-events:none;}
 .price-main{font-family:'Instrument Serif',serif;font-size:clamp(2.5rem,6vw,4rem);font-weight:400;letter-spacing:-.035em;color:var(--gold2);line-height:1;transition:color .4s;}
-.price-sub{font-size:.76rem;color:var(--muted);margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
-.price-sub-dot{width:3px;height:3px;border-radius:50%;background:var(--muted2);}
+/* U1: karat row */
+.karat-row{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center;}
+.karat-item{font-family:'DM Mono',monospace;font-size:.68rem;color:var(--muted);}
+.karat-item strong{color:var(--text);font-weight:500;}
+.karat-sep{color:var(--muted2);font-size:.6rem;}
 .price-row{margin-top:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .price-chg{font-family:'DM Mono',monospace;font-size:1.25rem;font-weight:500;}
 .retail-tag{background:rgba(212,168,67,.08);border:1px solid rgba(212,168,67,.15);border-radius:4px;
   padding:2px 7px;font-size:.62rem;color:var(--gold-dim);font-family:'DM Mono',monospace;}
+[data-theme="light"] .retail-tag{background:rgba(160,120,40,.08);color:var(--gold);}
 
-/* ── Badges ── */
+/* ══ Badges ══ */
 .badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:99px;font-size:.68rem;font-weight:500;letter-spacing:.04em;}
-.b-bull{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.18);}
-.b-bear{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.18);}
-.b-warn{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.18);}
-.b-neu{background:rgba(107,107,122,.12);color:var(--muted);border:1px solid var(--border);}
+.b-bull{background:rgba(34,197,94,.1);color:var(--green);border:1px solid rgba(34,197,94,.22);}
+.b-bear{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.22);}
+.b-warn{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.22);}
+.b-neu{background:rgba(107,107,122,.1);color:var(--muted);border:1px solid var(--border);}
 .b-gold{background:rgba(212,168,67,.1);color:var(--gold);border:1px solid rgba(212,168,67,.2);}
-.b-blue{background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.18);}
+.b-blue{background:rgba(96,165,250,.1);color:var(--blue);border:1px solid rgba(96,165,250,.22);}
+[data-theme="light"] .b-bull{background:rgba(22,163,74,.08);}
+[data-theme="light"] .b-bear{background:rgba(220,38,38,.08);}
+[data-theme="light"] .b-warn{background:rgba(180,83,9,.08);}
+[data-theme="light"] .b-gold{background:rgba(160,120,40,.08);}
 
-/* ── OHLC ── */
+/* ══ OHLC ══ */
 .ohlc{display:grid;grid-template-columns:repeat(5,1fr);}
 .ohlc-item{padding:12px 14px;border-right:1px solid var(--border);}
 .ohlc-item:last-child{border-right:none;}
@@ -1342,13 +1602,13 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .range-lbls{display:flex;justify-content:space-between;font-family:'DM Mono',monospace;font-size:.65rem;color:var(--muted);margin-bottom:7px;}
 .range-track{height:3px;background:var(--surface3);border-radius:2px;position:relative;}
 .range-fill{position:absolute;inset:0;border-radius:2px;background:linear-gradient(90deg,var(--red),var(--gold),var(--green));}
-.range-cursor{position:absolute;top:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:var(--gold2);border:2px solid var(--bg);box-shadow:0 0 8px rgba(240,197,96,.5);transition:left .6s;}
+.range-cursor{position:absolute;top:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:var(--gold2);border:2px solid var(--bg);box-shadow:0 0 8px rgba(212,168,67,.45);transition:left .6s;}
 
-/* ── Stat ── */
+/* ══ Stat ══ */
 .stat-val{font-family:'DM Mono',monospace;font-size:1.3rem;font-weight:500;line-height:1;margin-bottom:4px;}
 .stat-sub{font-size:.7rem;color:var(--muted);font-family:'DM Mono',monospace;}
 
-/* ── Chart ── */
+/* ══ Chart ══ */
 .chart-card{padding:0;overflow:hidden;}
 .chart-hdr{display:flex;align-items:center;justify-content:space-between;padding:16px 20px 10px;flex-wrap:wrap;gap:8px;}
 .chart-hdr .card-lbl{margin-bottom:0;}
@@ -1357,64 +1617,71 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .chart-meta-item span{color:var(--text);}
 canvas#gc{display:block;width:100%;height:240px;cursor:crosshair;}
 .chart-wrap{position:relative;}
-.chart-tip{display:none;position:absolute;background:var(--surface2);border:1px solid var(--border2);border-radius:var(--rs);padding:8px 12px;font-family:'DM Mono',monospace;font-size:.7rem;color:var(--text);pointer-events:none;z-index:20;white-space:nowrap;box-shadow:0 8px 28px rgba(0,0,0,.5);}
+/* U6: chart tooltip semi-transparent */
+.chart-tip{display:none;position:absolute;
+  background:var(--tt-bg);border:1px solid var(--tt-border);
+  border-radius:var(--rs);padding:8px 12px;
+  font-family:'DM Mono',monospace;font-size:.7rem;color:var(--text);
+  pointer-events:none;z-index:20;white-space:nowrap;
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);}
 .chart-foot{display:flex;align-items:center;justify-content:space-between;padding:7px 20px 12px;flex-wrap:wrap;gap:8px;}
 .chart-legend{display:flex;gap:12px;flex-wrap:wrap;}
 .leg-item{font-size:.62rem;color:var(--muted);display:flex;align-items:center;gap:5px;}
 .leg-line{width:11px;height:2px;border-radius:1px;}
 .chart-ts{font-family:'DM Mono',monospace;font-size:.63rem;color:var(--muted2);}
 
-/* ── Signals ── */
+/* ══ Signals — U7: NO tooltip on chip, tooltip moved to debug ══ */
 .sig-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:7px;}
 .sig-chip{background:var(--surface2);border:1px solid var(--border);border-radius:var(--rs);padding:10px 11px;
-  display:flex;flex-direction:column;gap:3px;transition:border-color .2s;position:relative;cursor:help;}
-.sig-chip.ready{border-color:rgba(34,197,94,.22);background:rgba(34,197,94,.03);}
-.sig-chip.bear-ready{border-color:rgba(239,68,68,.22);background:rgba(239,68,68,.03);}
-.sig-chip:hover{border-color:var(--gold-dim);z-index:10;}
+  display:flex;flex-direction:column;gap:3px;transition:border-color .2s;}
+.sig-chip.ready{border-color:rgba(34,197,94,.28);background:rgba(34,197,94,.04);}
+.sig-chip.bear-ready{border-color:rgba(239,68,68,.28);background:rgba(239,68,68,.04);}
+[data-theme="light"] .sig-chip{background:var(--surface2);}
+[data-theme="light"] .sig-chip.ready{background:rgba(22,163,74,.05);}
+[data-theme="light"] .sig-chip.bear-ready{background:rgba(220,38,38,.05);}
 .sig-top{display:flex;align-items:center;justify-content:space-between;}
 .sig-icon{font-size:.95rem;}
-.sig-name{font-size:.64rem;color:var(--muted);margin-top:1px;}
+.sig-name{font-size:.64rem;color:var(--muted);}
 .sig-cd{font-family:'DM Mono',monospace;font-size:.61rem;color:var(--muted2);}
 .sdot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
 .sdot-ready{background:var(--green);box-shadow:0 0 5px rgba(34,197,94,.5);}
 .sdot-cool{background:var(--muted2);}
 .sdot-bear{background:var(--red);}
+/* pooled indicator */
+.sdot-pool{background:var(--yellow);box-shadow:0 0 5px rgba(234,179,8,.5);animation:blink 1.4s ease-in-out infinite;}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 
-/* ── Signal tooltip (plain English) ── */
-.sig-tooltip{
-  display:none;position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);
-  background:#1a1a20;border:1px solid var(--border2);border-radius:10px;
-  padding:12px 14px;width:280px;max-width:90vw;
-  font-size:.73rem;line-height:1.6;color:var(--text);
-  box-shadow:0 16px 48px rgba(0,0,0,.8);z-index:200;pointer-events:none;
-}
-.sig-tooltip::after{
-  content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);
-  border:6px solid transparent;border-top-color:#2d2d38;
-}
-.sig-chip:hover .sig-tooltip{display:block;}
-.sig-tooltip-title{font-weight:600;color:var(--gold2);margin-bottom:5px;font-size:.75rem;}
-.sig-tooltip-body{color:var(--muted);line-height:1.55;}
-/* keep tooltip within viewport on edges */
-.sig-chip:first-child .sig-tooltip,
-.sig-chip:nth-child(4n+1) .sig-tooltip{left:0;transform:none;}
-.sig-chip:nth-child(4n) .sig-tooltip{left:auto;right:0;transform:none;}
-.sig-chip:nth-child(4n) .sig-tooltip::after{left:auto;right:20px;transform:none;}
-.sig-chip:first-child .sig-tooltip::after{left:20px;transform:none;}
-.sig-chip:nth-child(4n+1) .sig-tooltip::after{left:20px;transform:none;}
-
-/* ── Alert list ── */
+/* ══ Alert list ══ */
 .alert-list{display:flex;flex-direction:column;gap:5px;max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--border2) transparent;}
 .alert-row{display:flex;align-items:center;gap:9px;padding:7px 9px;background:var(--surface2);border-radius:var(--rs);border:1px solid var(--border);font-size:.73rem;cursor:default;position:relative;transition:border-color .15s,background .15s;}
 .alert-row:hover{border-color:var(--gold-dim);background:rgba(212,168,67,.04);}
+[data-theme="light"] .alert-row:hover{background:rgba(160,120,40,.05);}
 .al-time{font-family:'DM Mono',monospace;color:var(--muted);font-size:.65rem;flex-shrink:0;}
 .al-key{flex:1;color:var(--text);}
 .empty-msg{color:var(--muted);font-size:.76rem;text-align:center;padding:20px;}
-.al-popup{display:none;position:absolute;left:0;top:calc(100% + 5px);background:var(--surface);border:1px solid var(--border2);border-radius:var(--rs);padding:11px 14px;z-index:100;width:310px;max-width:92vw;box-shadow:0 14px 48px rgba(0,0,0,.65);font-family:'DM Mono',monospace;font-size:.7rem;line-height:1.75;color:var(--text);white-space:pre-wrap;word-break:break-word;pointer-events:none;}
+/* U6: alert popup semi-transparent */
+.al-popup{display:none;position:absolute;left:0;top:calc(100% + 5px);
+  background:var(--tt-bg);border:1px solid var(--tt-border);
+  border-radius:var(--rs);padding:11px 14px;z-index:100;width:310px;max-width:92vw;
+  box-shadow:var(--shadow-lg);font-family:'DM Mono',monospace;font-size:.7rem;
+  line-height:1.75;color:var(--text);white-space:pre-wrap;word-break:break-word;
+  pointer-events:none;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
 .alert-row:hover .al-popup{display:block;}
 .alert-row:nth-last-child(-n+3) .al-popup{top:auto;bottom:calc(100% + 5px);}
 
-/* ── Debug ── */
+/* ══ U7: Signal explanation tooltips — debug section only ══ */
+.sig-explain-grid{display:flex;flex-direction:column;gap:6px;margin-top:8px;}
+.sig-explain-row{background:var(--surface2);border:1px solid var(--border);border-radius:var(--rs);
+  padding:10px 13px;font-size:.73rem;line-height:1.55;color:var(--text);}
+[data-theme="light"] .sig-explain-row{background:var(--surface2);}
+.sig-explain-hd{display:flex;align-items:center;gap:8px;margin-bottom:4px;}
+.sig-explain-hd .sei{font-size:.9rem;}
+.sig-explain-hd .set{font-weight:600;color:var(--gold2);font-size:.75rem;}
+[data-theme="light"] .sig-explain-hd .set{color:var(--gold);}
+.sig-explain-body{color:var(--muted);line-height:1.55;}
+
+/* ══ Debug ══ */
 .sec-title{font-size:.63rem;font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--muted2);margin:22px 0 8px;display:flex;align-items:center;gap:10px;}
 .sec-title::after{content:'';flex:1;height:1px;background:var(--border);}
 details{margin-top:8px;}
@@ -1425,14 +1692,14 @@ details[open] summary::before{transform:rotate(90deg);}
 .dbody{background:var(--surface);border:1px solid var(--border);border-top:none;border-radius:0 0 var(--rs) var(--rs);padding:16px;}
 .dt{width:100%;border-collapse:collapse;font-family:'DM Mono',monospace;font-size:.7rem;}
 .dt th{text-align:left;color:var(--muted);font-weight:400;font-size:.61rem;text-transform:uppercase;letter-spacing:.08em;padding:5px 8px;border-bottom:1px solid var(--border);}
-.dt td{padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:middle;}
+.dt td{padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:middle;color:var(--text);}
 .dt tr:last-child td{border-bottom:none;}
 .dt td:first-child{color:var(--muted);}
 .ok{color:var(--green);}.warn{color:var(--yellow);}.fail{color:var(--red);}
 .ttl-bar{height:3px;background:var(--surface2);border-radius:2px;overflow:hidden;margin-top:4px;}
 .ttl-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--gold-dim),var(--gold));}
 
-/* ── Responsive ── */
+/* ══ Responsive ══ */
 @media(max-width:740px){
   .g3{grid-template-columns:1fr 1fr;}
   .g2{grid-template-columns:1fr;}
@@ -1442,7 +1709,7 @@ details[open] summary::before{transform:rotate(90deg);}
   .ohlc-item:nth-child(5){border-top:1px solid var(--border);border-right:none;}
   canvas#gc{height:190px;}
   .al-popup{width:260px;}
-  .sig-tooltip{width:230px;}
+  .hdr-right{gap:6px;}
 }
 @media(max-width:440px){
   .g3{grid-template-columns:1fr;}
@@ -1454,6 +1721,8 @@ details[open] summary::before{transform:rotate(90deg);}
   .ohlc-item:nth-child(5){border-top:1px solid var(--border);border-right:none;grid-column:span 2;}
   .toast-stack{bottom:12px;right:12px;left:12px;}
   .toast{max-width:100%;}
+  .theme-toggle span{display:none;}
+  .hdr-right{gap:5px;}
 }
 .fi{animation:fi .45s ease both;}
 @keyframes fi{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
@@ -1473,12 +1742,36 @@ details[open] summary::before{transform:rotate(90deg);}
     <p>UAE · 24K · AED/gram · Active 08:00–22:00</p>
   </div>
   <div class="hdr-right">
+
+    <!-- U4: Theme toggle -->
+    <div class="theme-toggle" id="themeToggle" title="Toggle light/dark theme">
+      <span class="icon-sun">☀️</span>
+      <span class="icon-moon">🌙</span>
+      <div class="toggle-track"><div class="toggle-thumb"></div></div>
+      <span>Theme</span>
+    </div>
+
+    <!-- U3: Currency selector -->
+    <div class="currency-sel" id="currencySel">
+      <div class="currency-btn" id="currencyBtn">
+        <svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1v8M2 3h5.5M2 7h5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span id="currencyLabel">AED</span>
+        <svg width="8" height="8" viewBox="0 0 8 8" fill="none"><path d="M1.5 3L4 5.5 6.5 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="currency-drop" id="currencyDrop">
+        <div class="currency-opt active" data-cur="AED"><span>AED</span><span class="co-sym">د.إ</span><span class="co-chk">✓</span></div>
+        <div class="currency-opt" data-cur="USD"><span>USD</span><span class="co-sym">$</span><span class="co-chk">✓</span></div>
+        <div class="currency-opt" data-cur="INR"><span>INR</span><span class="co-sym">₹</span><span class="co-chk">✓</span></div>
+        <div class="currency-opt" data-cur="PKR"><span>PKR</span><span class="co-sym">₨</span><span class="co-chk">✓</span></div>
+      </div>
+    </div>
+
     <!-- Bell notification button -->
     <div class="bell-btn" id="bellBtn" title="Enable browser notifications">
       🔔
       <div class="bell-badge" id="bellBadge"></div>
-      <div class="bell-tip" id="bellTip">Click to enable alerts in browser</div>
     </div>
+
     <div>
       <div class="last-run">
         <span class="live-dot"></span>
@@ -1497,19 +1790,20 @@ details[open] summary::before{transform:rotate(90deg);}
     <span class="retail-tag">igold.ae retail incl. VAT &amp; markup</span>
   </div>
   <div style="margin-top:12px;">
+    <!-- U1: Primary hero shows retail price -->
     <div class="price-main" id="heroPrice">
-      AED <span id="heroAed"><?= number_format($display_aed, 2) ?></span><span style="font-size:.42em;color:var(--gold-dim);margin-left:7px;">/g</span>
+      <span id="heroCurrSym">AED</span> <span id="heroAed"><?= number_format($display_aed, 2) ?></span><span style="font-size:.42em;color:var(--gold-dim);margin-left:7px;">/g</span>
     </div>
-    <div class="price-sub">
-      <span>What you pay in-store, per gram</span>
-      <?php if ($markup_pct > 0): ?>
-        <span class="price-sub-dot"></span>
-        <span>+<?= number_format($markup_pct, 2) ?>% over spot</span>
-      <?php endif; ?>
-      <?php if ($spot_aed > 0): ?>
-        <span class="price-sub-dot"></span>
-        <span>Spot: AED <?= number_format($spot_aed, 2) ?>/g</span>
-      <?php endif; ?>
+    <!-- U1: karat prices in one grey sub-line -->
+    <div class="karat-row" id="karatRow">
+      <?php
+        $first = true;
+        foreach ($karat_prices as $k => $p):
+          if (!$first) echo '<span class="karat-sep">·</span>';
+          $first = false;
+      ?>
+        <span class="karat-item" data-karat="<?= $k ?>"><strong><?= $k ?></strong> <span class="karat-val"><?= number_format($p, 2) ?></span></span>
+      <?php endforeach; ?>
     </div>
   </div>
   <div class="price-row">
@@ -1527,19 +1821,19 @@ details[open] summary::before{transform:rotate(90deg);}
 
 <!-- ── OHLC range ────────────────────────────────────────────────── -->
 <div class="card mb12 fi" style="padding:0;overflow:hidden;">
-  <div style="padding:13px 16px 0;"><div class="card-lbl"><span class="dot"></span>Session Range · AED/gram</div></div>
+  <div style="padding:13px 16px 0;"><div class="card-lbl"><span class="dot"></span>Session Range · <span class="cur-lbl">AED</span>/gram</div></div>
   <div class="ohlc">
-    <div class="ohlc-item"><div class="ohlc-lbl">Day Open</div><div class="ohlc-val" style="color:var(--muted);" id="ohlcOpen">AED <?= number_format($open_aed,2) ?></div></div>
-    <div class="ohlc-item"><div class="ohlc-lbl">Session High</div><div class="ohlc-val" style="color:var(--green);" id="ohlcHigh"><?= $high_aed!==null?'AED '.number_format($high_aed,2):'—' ?></div></div>
-    <div class="ohlc-item"><div class="ohlc-lbl">Session Low</div><div class="ohlc-val" style="color:var(--red);" id="ohlcSessLow"><?= $sl_aed!==null?'AED '.number_format($sl_aed,2):'—' ?></div></div>
-    <div class="ohlc-item"><div class="ohlc-lbl">Pre-mkt Floor</div><div class="ohlc-val" style="color:var(--yellow);" id="ohlcPmLow"><?= $pm_aed!==null?'AED '.number_format($pm_aed,2):'—' ?></div></div>
+    <div class="ohlc-item"><div class="ohlc-lbl">Day Open</div><div class="ohlc-val" style="color:var(--muted);" id="ohlcOpen"><span class="cur-sym">AED</span> <?= number_format($open_aed,2) ?></div></div>
+    <div class="ohlc-item"><div class="ohlc-lbl">Session High</div><div class="ohlc-val" style="color:var(--green);" id="ohlcHigh"><?= $high_aed!==null?'<span class="cur-sym">AED</span> '.number_format($high_aed,2):'—' ?></div></div>
+    <div class="ohlc-item"><div class="ohlc-lbl">Session Low</div><div class="ohlc-val" style="color:var(--red);" id="ohlcSessLow"><?= $sl_aed!==null?'<span class="cur-sym">AED</span> '.number_format($sl_aed,2):'—' ?></div></div>
+    <div class="ohlc-item"><div class="ohlc-lbl">Pre-mkt Floor</div><div class="ohlc-val" style="color:var(--yellow);" id="ohlcPmLow"><?= $pm_aed!==null?'<span class="cur-sym">AED</span> '.number_format($pm_aed,2):'—' ?></div></div>
     <div class="ohlc-item"><div class="ohlc-lbl">Day Range</div><div class="ohlc-val"><?= number_format($range_pct,2) ?>%</div></div>
   </div>
   <div class="range-wrap" style="margin-top:10px;">
     <div class="range-lbls">
-      <span id="rangeLowLbl">Low <?= $sl_aed!==null?'AED '.number_format($sl_aed,2):'—' ?></span>
+      <span id="rangeLowLbl">Low <span class="cur-sym">AED</span> <?= $sl_aed!==null?number_format($sl_aed,2):'—' ?></span>
       <span style="font-size:.6rem;color:var(--muted2);">Current position in today's range</span>
-      <span id="rangeHighLbl">High <?= $high_aed!==null?'AED '.number_format($high_aed,2):'—' ?></span>
+      <span id="rangeHighLbl">High <span class="cur-sym">AED</span> <?= $high_aed!==null?number_format($high_aed,2):'—' ?></span>
     </div>
     <div class="range-track">
       <div class="range-fill"></div>
@@ -1551,7 +1845,7 @@ details[open] summary::before{transform:rotate(90deg);}
 <!-- ── Live Chart ─────────────────────────────────────────────────── -->
 <div class="card chart-card mb12 fi">
   <div class="chart-hdr">
-    <div class="card-lbl" style="margin-bottom:0;"><span class="dot"></span>Live Price Chart · AED/gram</div>
+    <div class="card-lbl" style="margin-bottom:0;"><span class="dot"></span>Live Price Chart · <span class="cur-lbl">AED</span>/gram</div>
     <div class="chart-meta">
       <div class="chart-meta-item">Polls every <span>15s</span></div>
       <div class="chart-meta-item">Points: <span id="chartPts">—</span></div>
@@ -1564,7 +1858,7 @@ details[open] summary::before{transform:rotate(90deg);}
   </div>
   <div class="chart-foot">
     <div class="chart-legend">
-      <div class="leg-item"><div class="leg-line" style="background:var(--gold);"></div>Price AED/g</div>
+      <div class="leg-item"><div class="leg-line" style="background:var(--gold);"></div>Price <span class="cur-lbl">AED</span>/g</div>
       <div class="leg-item"><div class="leg-line" style="background:var(--red);opacity:.6;"></div>Session Low</div>
       <div class="leg-item"><div class="leg-line" style="background:var(--yellow);opacity:.6;"></div>Pre-mkt Floor</div>
       <div class="leg-item"><div class="leg-line" style="background:var(--green);opacity:.6;"></div>Session High</div>
@@ -1578,15 +1872,16 @@ details[open] summary::before{transform:rotate(90deg);}
 <div class="g3">
   <div class="card fi">
     <div class="card-lbl"><span class="dot"></span>US Dollar Strength (DXY)</div>
-    <div class="stat-val" style="color:<?= $dxy_color ?>;"><?= $dxy!==null?number_format($dxy,3):'—' ?></div>
+    <div class="stat-val" id="dxyVal" style="color:var(--dxy-color);"><?= $dxy!==null?number_format($dxy,3):'—' ?></div>
     <div class="stat-sub"><?= dxy_label_plain($dxy) ?> · lower = gold bullish</div>
     <?php if($dxy!==null&&$dxy<DXY_WEAK_LEVEL): ?>
       <div style="margin-top:8px;"><span class="badge b-bull">Below 100 · gold favoured</span></div>
     <?php endif; ?>
   </div>
+  <!-- U2: TIP shown in AED (converted from USD) -->
   <div class="card fi">
     <div class="card-lbl"><span class="dot"></span>Inflation Indicator (TIP)</div>
-    <div class="stat-val"><?= $tip!==null?'$'.number_format($tip,2):'—' ?></div>
+    <div class="stat-val" id="tipVal"><?= $tip_aed!==null?'<span class="cur-sym">AED</span> '.number_format($tip_aed,2):'—' ?></div>
     <div class="stat-sub">Rising = inflation up = gold bullish</div>
   </div>
   <div class="card fi">
@@ -1604,29 +1899,29 @@ details[open] summary::before{transform:rotate(90deg);}
 
 <!-- ── Signals + Alerts ──────────────────────────────────────────── -->
 <div class="g2">
+  <!-- U7: Signal chips — no tooltip here, just status indicators -->
   <div class="card fi">
     <div class="card-lbl"><span class="dot"></span>Signal Status
-      <span style="font-size:.58rem;color:var(--muted2);font-weight:400;margin-left:4px;">hover for explanation</span>
+      <span style="font-size:.58rem;color:var(--muted2);font-weight:400;margin-left:4px;">signal explanations in debug ↓</span>
     </div>
     <div class="sig-grid">
       <?php foreach($signal_meta as $key => [$icon, $name, $type, $tooltip_text]):
-        $cdm = $cooldowns[$key] ?? 60;
-        $lts = $last_alerts[$key] ?? 0;
-        $rem = max(0, $cdm * 60 - ($now - $lts));
-        $rdy = ($rem === 0);
-        $dc  = $rdy ? ($type === 'bull' ? 'sdot-ready' : 'sdot-bear') : 'sdot-cool';
-        $cls = $rdy ? ($type === 'bull' ? 'ready' : 'bear-ready') : '';
-        $cds = $rdy ? 'Ready' : (floor($rem/60).'m '.($rem%60).'s');
+        $cdm  = $cooldowns[$key] ?? 60;
+        $lts  = $last_alerts[$key] ?? 0;
+        $rem  = max(0, $cdm * 60 - ($now - $lts));
+        $rdy  = ($rem === 0);
+        $pooled_here = isset($signal_pool_st[$key]);
+        // dot class
+        if ($pooled_here)         $dc = 'sdot-pool';
+        elseif ($rdy)             $dc = $type === 'bull' ? 'sdot-ready' : 'sdot-bear';
+        else                      $dc = 'sdot-cool';
+        $cls  = $rdy ? ($type === 'bull' ? 'ready' : 'bear-ready') : '';
+        $cds  = $pooled_here ? 'Pooled⚡' : ($rdy ? 'Ready' : (floor($rem/60).'m '.($rem%60).'s'));
       ?>
         <div class="sig-chip <?= $cls ?>">
           <div class="sig-top"><span class="sig-icon"><?= $icon ?></span><span class="sdot <?= $dc ?>"></span></div>
           <div class="sig-name"><?= htmlspecialchars($name) ?></div>
           <div class="sig-cd"><?= $cds ?></div>
-          <!-- Plain English tooltip -->
-          <div class="sig-tooltip">
-            <div class="sig-tooltip-title"><?= $icon ?> <?= htmlspecialchars($name) ?></div>
-            <div class="sig-tooltip-body"><?= htmlspecialchars($tooltip_text) ?></div>
-          </div>
         </div>
       <?php endforeach; ?>
     </div>
@@ -1663,7 +1958,27 @@ details[open] summary::before{transform:rotate(90deg);}
 
 <!-- ── Debug ─────────────────────────────────────────────────────── -->
 <div class="sec-title">Diagnostics &amp; System</div>
+
+<!-- U7: Signal explanations in their own collapsible inside debug -->
 <details>
+  <summary>Signal Explanations (plain English)</summary>
+  <div class="dbody">
+    <div class="sig-explain-grid">
+      <?php foreach($signal_meta as $key => [$icon, $name, $type, $tooltip_text]): ?>
+        <div class="sig-explain-row">
+          <div class="sig-explain-hd">
+            <span class="sei"><?= $icon ?></span>
+            <span class="set"><?= htmlspecialchars($name) ?></span>
+            <span class="badge <?= $type==='bear'?'b-bear':'b-bull' ?>" style="font-size:.6rem;"><?= $type ?></span>
+          </div>
+          <div class="sig-explain-body"><?= htmlspecialchars($tooltip_text) ?></div>
+        </div>
+      <?php endforeach; ?>
+    </div>
+  </div>
+</details>
+
+<details style="margin-top:8px;">
   <summary>API Metrics, State Inspector &amp; Signal Cooldowns</summary>
   <div class="dbody">
     <?php if($crumb_age!==null):
@@ -1678,14 +1993,14 @@ details[open] summary::before{transform:rotate(90deg);}
     <?php endif; ?>
 
     <table class="dt">
-      <thead><tr><th>Source</th><th>Status</th><th>Endpoint</th><th>Latency</th><th>Value (AED)</th></tr></thead>
+      <thead><tr><th>Source</th><th>Status</th><th>Endpoint</th><th>Latency</th><th>Value</th></tr></thead>
       <tbody>
         <tr>
           <td>igold.ae (retail)</td>
           <td class="<?= $display_aed>0?'ok':'fail' ?>"><?= $display_aed>0?'OK':'FAIL' ?></td>
           <td>HTML scrape</td>
           <td><?= $igold_ms!==null?$igold_ms.' ms':'—' ?></td>
-          <td>AED <?= number_format($display_aed,2) ?>/g (retail)</td>
+          <td>AED <?= number_format($display_aed,2) ?>/g (retail 24K)</td>
         </tr>
         <?php foreach(['GC=F'=>'Gold futures','DX-Y.NYB'=>'DXY','TIP'=>'TIP ETF','GLD'=>'GLD ETF'] as $t=>$l):
           $m=$yf_meta[$t]??null; ?>
@@ -1697,7 +2012,7 @@ details[open] summary::before{transform:rotate(90deg);}
             <td><?php
               if($t==='GC=F')     echo 'AED '.number_format($spot_aed,2).'/g (spot)';
               if($t==='DX-Y.NYB') echo $dxy!==null?number_format($dxy,3):'—';
-              if($t==='TIP')      echo $tip!==null?'$'.number_format($tip,2):'—';
+              if($t==='TIP')      echo $tip!==null?'USD $'.number_format($tip,2).' / AED '.number_format($tip*USD_TO_AED,2):'—';
               if($t==='GLD')      echo $gld_vol!==null?number_format($gld_vol).' vol':'—';
             ?></td>
           </tr>
@@ -1723,6 +2038,7 @@ details[open] summary::before{transform:rotate(90deg);}
         <tr><td>EMA fast/slow</td><td colspan="2"><?= EMA_FAST ?>/<?= EMA_SLOW ?> · <?= isset($s['ema_fast_val'])?'F='.number_format((float)$s['ema_fast_val'],2):'warming up' ?> <?= isset($s['ema_slow_val'])?'S='.number_format((float)$s['ema_slow_val'],2):'' ?></td></tr>
         <tr><td>consec_up</td><td colspan="2"><?= $consec ?></td></tr>
         <tr><td>signals_today</td><td colspan="2"><?= $signals_today ?></td></tr>
+        <tr><td>signal_pool</td><td colspan="2" class="<?= !empty($signal_pool_st)?'warn':'ok' ?>"><?= !empty($signal_pool_st)?'Active: '.implode(', ', array_keys($signal_pool_st)):'Empty' ?></td></tr>
         <tr><td>chart history</td><td colspan="2"><?= isset($s['chart_history'])?count($s['chart_history']):0 ?> pts / <?= CHART_HISTORY_MAX ?></td></tr>
         <tr><td>last cron</td><td colspan="2"><?= $last_run_str ?> (<?= $age_str ?>)</td></tr>
         <tr><td>PHP version</td><td colspan="2"><?= PHP_VERSION ?> · <?= date('Y-m-d H:i:s T') ?></td></tr>
@@ -1731,17 +2047,19 @@ details[open] summary::before{transform:rotate(90deg);}
 
     <div style="margin-top:14px;"></div>
     <table class="dt">
-      <thead><tr><th>Signal</th><th>Cooldown</th><th>Last fired</th><th>Remaining</th><th>Status</th></tr></thead>
+      <thead><tr><th>Signal</th><th>Cooldown</th><th>Last fired</th><th>Remaining</th><th>Pooled?</th><th>Status</th></tr></thead>
       <tbody>
         <?php foreach($cooldowns as $key=>$cdm):
           $lts=$last_alerts[$key]??0;$rem=max(0,$cdm*60-($now-$lts));$rdy=($rem===0);
+          $pooled_here=isset($signal_pool_st[$key]);
           $info=$signal_meta[$key]??['•',$key,'bull','']; ?>
           <tr>
             <td><?= $info[0] ?> <?= htmlspecialchars($info[1]) ?></td>
             <td><?= $cdm ?>m</td>
             <td><?= $lts>0?date('H:i:s',$lts):'never' ?></td>
             <td style="font-family:'DM Mono',monospace;"><?= $rem>0?floor($rem/60).'m '.($rem%60).'s':'—' ?></td>
-            <td class="<?= $rdy?'ok':'warn' ?>"><?= $rdy?'READY':'COOLING' ?></td>
+            <td class="<?= $pooled_here?'warn':'ok' ?>"><?= $pooled_here?'YES (⚡ queued)':'no' ?></td>
+            <td class="<?= $rdy?'ok':($pooled_here?'warn':'') ?>"><?= $rdy?'READY':($pooled_here?'POOLED':'COOLING') ?></td>
           </tr>
         <?php endforeach; ?>
       </tbody>
@@ -1756,10 +2074,33 @@ details[open] summary::before{transform:rotate(90deg);}
 
 <script>
 // ══════════════════════════════════════════════════════════════════
-//  CONSTANTS
+//  CONFIG / CONSTANTS
 // ══════════════════════════════════════════════════════════════════
-const API_URL = '<?= htmlspecialchars($_SERVER['PHP_SELF'] ?? 'gold_monitor.php') ?>?api=1';
-const POLL_MS = 15000;
+const API_URL  = '<?= htmlspecialchars($_SERVER['PHP_SELF'] ?? 'gold_monitor.php') ?>?api=1';
+const POLL_MS  = 15000;
+
+// U3: currency conversion rates (AED base)
+const CUR_RATES   = <?= $currencies_json ?>;
+const CUR_SYMBOLS = <?= $symbols_json ?>;
+
+// U1: karat ratios for client-side conversion
+const KARAT_RATIOS = {
+  '24K': 1.0000, '22K': 0.9167, '21K': 0.8750,
+  '18K': 0.7500, '15K': 0.6250, '10K': 0.4167
+};
+
+// Raw AED values from server — converted client-side on currency change
+let RAW = {
+  displayAed:   <?= (float)$display_aed ?>,
+  spotAed:      <?= (float)$spot_aed ?>,
+  openAed:      <?= (float)$open_aed ?>,
+  highAed:      <?= $high_aed !== null ? (float)$high_aed : 'null' ?>,
+  sessLowAed:   <?= $sl_aed   !== null ? (float)$sl_aed   : 'null' ?>,
+  pmLowAed:     <?= $pm_aed   !== null ? (float)$pm_aed   : 'null' ?>,
+  tipUsd:       <?= $tip !== null ? (float)$tip : 'null' ?>,
+  karatAed:     <?= json_encode($karat_prices) ?>,
+  dayChg:       <?= (float)$day_chg ?>,
+};
 
 const SMETA = {
   day_low:       ['🔴','Session Low',     'bear'],
@@ -1779,6 +2120,129 @@ const SMETA = {
 };
 
 // ══════════════════════════════════════════════════════════════════
+//  U3: CURRENCY MANAGEMENT
+// ══════════════════════════════════════════════════════════════════
+let activeCur = getCookie('gm_currency') || 'AED';
+
+function getCookie(name) {
+  const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+function setCookie(name, val, days) {
+  const d = new Date(); d.setTime(d.getTime() + days*86400000);
+  document.cookie = `${name}=${encodeURIComponent(val)};expires=${d.toUTCString()};path=/`;
+}
+
+function cvt(aedVal) {
+  if (aedVal === null || aedVal === undefined) return null;
+  return aedVal * (CUR_RATES[activeCur] || 1);
+}
+function fmtPrice(aedVal, dp = 2) {
+  if (aedVal === null || aedVal === undefined) return '—';
+  const v = cvt(aedVal);
+  const sym = CUR_SYMBOLS[activeCur] || activeCur;
+  return sym + ' ' + v.toFixed(dp);
+}
+
+function applyCurrency() {
+  const sym  = CUR_SYMBOLS[activeCur] || activeCur;
+  const rate = CUR_RATES[activeCur] || 1;
+
+  // Update label in header button
+  document.getElementById('currencyLabel').textContent = activeCur;
+
+  // Sync all .cur-sym and .cur-lbl spans
+  document.querySelectorAll('.cur-sym').forEach(el => el.textContent = sym);
+  document.querySelectorAll('.cur-lbl').forEach(el => el.textContent = activeCur);
+
+  // Hero
+  document.getElementById('heroCurrSym').textContent = sym;
+  if (RAW.displayAed) {
+    document.getElementById('heroAed').textContent = cvt(RAW.displayAed).toFixed(2);
+  }
+
+  // Karat row — U1
+  document.querySelectorAll('[data-karat]').forEach(el => {
+    const k = el.dataset.karat;
+    const ratio = KARAT_RATIOS[k] || 1;
+    const aedBase = RAW.karatAed[k] || (RAW.displayAed * ratio);
+    el.querySelector('.karat-val').textContent = cvt(aedBase).toFixed(2);
+  });
+
+  // OHLC
+  const setEl = (id, val) => {
+    const el = document.getElementById(id);
+    if (!el || val === null) return;
+    const symSpan = el.querySelector('.cur-sym');
+    if (symSpan) { symSpan.textContent = sym; el.childNodes[1].textContent = ' ' + cvt(val).toFixed(2); }
+    else el.textContent = sym + ' ' + cvt(val).toFixed(2);
+  };
+  if (RAW.openAed)    setEl('ohlcOpen',    RAW.openAed);
+  if (RAW.highAed)    setEl('ohlcHigh',    RAW.highAed);
+  if (RAW.sessLowAed) setEl('ohlcSessLow', RAW.sessLowAed);
+  if (RAW.pmLowAed)   setEl('ohlcPmLow',   RAW.pmLowAed);
+
+  // Range labels
+  if (RAW.sessLowAed) document.getElementById('rangeLowLbl').innerHTML =
+    'Low <span class="cur-sym">' + sym + '</span> ' + cvt(RAW.sessLowAed).toFixed(2);
+  if (RAW.highAed) document.getElementById('rangeHighLbl').innerHTML =
+    'High <span class="cur-sym">' + sym + '</span> ' + cvt(RAW.highAed).toFixed(2);
+
+  // TIP (stored as USD in RAW.tipUsd — convert to selected currency via AED intermediate)
+  const tipEl = document.getElementById('tipVal');
+  if (tipEl && RAW.tipUsd !== null) {
+    const tipAed = RAW.tipUsd * <?= USD_TO_AED ?>;
+    const tipCur = tipAed * rate;
+    tipEl.innerHTML = `<span class="cur-sym">${sym}</span> ${tipCur.toFixed(2)}`;
+  }
+
+  // Mark active in dropdown
+  document.querySelectorAll('.currency-opt').forEach(o => {
+    o.classList.toggle('active', o.dataset.cur === activeCur);
+  });
+
+  // Redraw chart with new currency
+  drawChart();
+}
+
+// Currency dropdown
+const currSel = document.getElementById('currencySel');
+document.getElementById('currencyBtn').addEventListener('click', (e) => {
+  e.stopPropagation(); currSel.classList.toggle('open');
+});
+document.addEventListener('click', () => currSel.classList.remove('open'));
+document.querySelectorAll('.currency-opt').forEach(opt => {
+  opt.addEventListener('click', e => {
+    e.stopPropagation();
+    activeCur = opt.dataset.cur;
+    setCookie('gm_currency', activeCur, 365);
+    currSel.classList.remove('open');
+    applyCurrency();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════
+//  U4: THEME TOGGLE
+// ══════════════════════════════════════════════════════════════════
+function getTheme() { return getCookie('gm_theme') || 'dark'; }
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  setCookie('gm_theme', t, 365);
+  drawChart(); // redraw with correct colors
+}
+
+document.getElementById('themeToggle').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  setTheme(cur === 'dark' ? 'light' : 'dark');
+});
+
+// Apply saved theme on load
+(function() {
+  const t = getTheme();
+  document.documentElement.setAttribute('data-theme', t);
+})();
+
+// ══════════════════════════════════════════════════════════════════
 //  UAE CLOCK
 // ══════════════════════════════════════════════════════════════════
 (function clock() {
@@ -1789,7 +2253,7 @@ const SMETA = {
   const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   const p = v => String(v).padStart(2,'0');
   el.textContent = `${D[n.getDay()]}, ${p(n.getDate())} ${M[n.getMonth()]} ${n.getFullYear()} · ${p(n.getHours())}:${p(n.getMinutes())}:${p(n.getSeconds())} UAE`;
-  setTimeout(clock,1000);
+  setTimeout(clock, 1000);
 })();
 
 // ══════════════════════════════════════════════════════════════════
@@ -1799,22 +2263,17 @@ let notifEnabled = false;
 const seenNotifTs = new Set();
 
 function updateBellState() {
-  const btn   = document.getElementById('bellBtn');
-  const badge = document.getElementById('bellBadge');
-  const tip   = document.getElementById('bellTip');
+  const btn = document.getElementById('bellBtn');
   if (!btn) return;
   const perm = Notification.permission;
   if (perm === 'granted') {
-    btn.classList.add('granted');
-    btn.classList.remove('denied');
-    btn.innerHTML = '🔔<div class="bell-badge" id="bellBadge"></div><div class="bell-tip" id="bellTip">Notifications ON — alerts will appear here</div>';
+    btn.classList.add('granted'); btn.classList.remove('denied');
+    btn.querySelector('.bell-badge')?.remove();
+    btn.insertAdjacentHTML('beforeend','<div class="bell-badge" id="bellBadge"></div>');
     notifEnabled = true;
   } else if (perm === 'denied') {
     btn.classList.add('denied');
-    btn.innerHTML = '🔕<div class="bell-badge" id="bellBadge"></div><div class="bell-tip" id="bellTip">Notifications blocked — allow in browser settings</div>';
-    notifEnabled = false;
-  } else {
-    btn.innerHTML = '🔔<div class="bell-badge" id="bellBadge"></div><div class="bell-tip" id="bellTip">Click to enable alerts in this browser</div>';
+    btn.textContent = '🔕';
     notifEnabled = false;
   }
 }
@@ -1822,10 +2281,9 @@ function updateBellState() {
 document.getElementById('bellBtn').addEventListener('click', async () => {
   if (Notification.permission === 'denied') return;
   if (Notification.permission !== 'granted') {
-    const result = await Notification.requestPermission();
+    const r = await Notification.requestPermission();
     updateBellState();
-    if (result === 'granted') {
-      // Welcome notification
+    if (r === 'granted') {
       new Notification('Gold Monitor', {
         body: 'Alerts enabled! You\'ll be notified when buy signals fire.',
         icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><text y="26" font-size="28">🥇</text></svg>',
@@ -1840,21 +2298,16 @@ function fireNotification(notif) {
   const key = notif.key + '_' + notif.ts;
   if (seenNotifTs.has(key)) return;
   seenNotifTs.add(key);
-
-  // Always show in-page toast
   showToast(notif);
-
-  // Browser notification if permitted
   if (notifEnabled && Notification.permission === 'granted') {
     try {
       const n = new Notification(notif.title || 'Gold Alert', {
         body: notif.body || '',
         icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><text y="26" font-size="28">🥇</text></svg>',
-        tag: key,
-        requireInteraction: false,
+        tag: key, requireInteraction: false,
       });
       n.onclick = () => { window.focus(); n.close(); };
-    } catch(e) { /* sw not available */ }
+    } catch(e) {}
   }
 }
 
@@ -1864,26 +2317,15 @@ function fireNotification(notif) {
 function showToast(notif) {
   const stack = document.getElementById('toastStack');
   if (!stack) return;
-  const meta   = SMETA[notif.key] || ['🔔', 'Alert', 'bull'];
-  const isBear = meta[2] === 'bear';
-  const toast  = document.createElement('div');
-  toast.className = `toast ${isBear ? 'bear' : 'bull'}`;
-  toast.innerHTML = `
-    <div class="toast-icon">${meta[0]}</div>
-    <div class="toast-body">
-      <div class="toast-title">${notif.title || meta[1]}</div>
-      <div class="toast-msg">${notif.body || ''}</div>
-    </div>
-    <div class="toast-close" onclick="removeToast(this.parentElement)">✕</div>
-  `;
+  const meta  = SMETA[notif.key] || ['🔔','Alert','bull'];
+  const toast = document.createElement('div');
+  toast.className = `toast ${meta[2]==='bear'?'bear':'bull'}`;
+  toast.innerHTML = `<div class="toast-icon">${meta[0]}</div><div class="toast-body"><div class="toast-title">${notif.title||meta[1]}</div><div class="toast-msg">${notif.body||''}</div></div><div class="toast-close" onclick="removeToast(this.parentElement)">✕</div>`;
   stack.appendChild(toast);
-  // Auto-remove after 12s
   setTimeout(() => removeToast(toast), 12000);
-  // Max 5 toasts
   const toasts = stack.querySelectorAll('.toast');
   if (toasts.length > 5) removeToast(toasts[0]);
 }
-
 function removeToast(el) {
   if (!el || !el.parentElement) return;
   el.style.animation = 'slideOut .3s ease forwards';
@@ -1897,15 +2339,13 @@ function renderAlerts(alerts) {
   const list = document.getElementById('alertList');
   if (!list) return;
   if (!alerts || alerts.length === 0) {
-    list.innerHTML = '<div class="empty-msg">No alerts yet today</div>';
-    return;
+    list.innerHTML = '<div class="empty-msg">No alerts yet today</div>'; return;
   }
-  // Build set of existing timestamps
   const existing = new Set([...list.querySelectorAll('.alert-row')].map(r => r.dataset.ts));
   let changed = false;
   alerts.slice(0, 20).forEach(al => {
     const ts = String(al.ts || '');
-    if (existing.has(ts)) return; // already shown — skip (dedup fix)
+    if (existing.has(ts)) return;
     const key  = al.key || '';
     const info = SMETA[key] || ['•', key, 'bull'];
     const bc   = info[2] === 'bear' ? 'b-bear' : 'b-bull';
@@ -1915,7 +2355,6 @@ function renderAlerts(alerts) {
     row.innerHTML = `<span class="al-time">${al.time||'—'}</span><span>${info[0]}</span><span class="al-key">${info[1]}</span><span class="badge ${bc}">${info[2]}</span><div class="al-popup">${tt}</div>`;
     list.prepend(row); changed = true;
   });
-  // Trim to 20
   list.querySelectorAll('.alert-row').forEach((r,i) => { if (i>=20) r.remove(); });
   if (changed) {
     const c = document.getElementById('sigCount');
@@ -1929,239 +2368,248 @@ function renderAlerts(alerts) {
 const cv  = document.getElementById('gc');
 const ctx = cv.getContext('2d');
 let chartData=[], alertData=[], hoveredIdx=null;
-const C = {gold:'#d4a843',gold2:'#f0c560',green:'#22c55e',red:'#ef4444',yellow:'#eab308',muted:'#6b6b7a',bg:'#09090b',border:'#222228'};
-const PAD = {top:20,right:18,bottom:36,left:64};
 
-function dpr(){return Math.min(window.devicePixelRatio||1,2);}
-function resizeCanvas(){
-  const w=cv.parentElement.getBoundingClientRect().width;
-  const h=parseInt(getComputedStyle(cv).height)||240;
-  cv.width=w*dpr();cv.height=h*dpr();
-  cv.style.width=w+'px';cv.style.height=h+'px';
+function getThemeColors() {
+  const s = getComputedStyle(document.documentElement);
+  const get = v => s.getPropertyValue(v).trim();
+  return {
+    gold:    get('--gold')   || '#d4a843',
+    gold2:   get('--gold2')  || '#f0c560',
+    green:   get('--green')  || '#22c55e',
+    red:     get('--red')    || '#ef4444',
+    yellow:  get('--yellow') || '#eab308',
+    muted:   get('--muted')  || '#6b6b7a',
+    border:  get('--border') || '#222228',
+    text:    get('--text')   || '#e8e8ec',
+    surface: get('--surface')|| '#111113',
+  };
+}
+
+const PAD = {top:20, right:18, bottom:36, left:68};
+
+function dpr() { return Math.min(window.devicePixelRatio || 1, 2); }
+function resizeCanvas() {
+  const w = cv.parentElement.getBoundingClientRect().width;
+  const h = parseInt(getComputedStyle(cv).height) || 240;
+  cv.width  = w * dpr(); cv.height = h * dpr();
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';
   drawChart();
 }
 
-function drawChart(){
-  const R=dpr();ctx.setTransform(R,0,0,R,0,0);
-  const W=cv.offsetWidth,H=cv.offsetHeight;
+function drawChart() {
+  const R = dpr(); ctx.setTransform(R,0,0,R,0,0);
+  const W = cv.offsetWidth, H = cv.offsetHeight;
+  const C = getThemeColors();
   ctx.clearRect(0,0,W,H);
 
-  if(!chartData||chartData.length<2){
-    ctx.fillStyle=C.muted;ctx.font='13px monospace';ctx.textAlign='center';
-    ctx.fillText('Waiting for data…',W/2,H/2);return;
+  if (!chartData || chartData.length < 2) {
+    ctx.fillStyle = C.muted; ctx.font = '13px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('Waiting for data…', W/2, H/2); return;
   }
 
-  const prices=chartData.map(d=>d.spot_aed??d.display_aed??d.aed);
-  const minP=Math.min(...prices),maxP=Math.max(...prices);
-  const rng=maxP-minP||0.5;
-  const pad=rng*0.12;
-  const lo=minP-pad,hi=maxP+pad;
-  const PW=W-PAD.left-PAD.right,PH=H-PAD.top-PAD.bottom;
-  const xOf=i=>PAD.left+(i/(chartData.length-1))*PW;
-  const yOf=v=>PAD.top+(1-(v-lo)/(hi-lo))*PH;
+  const rate    = CUR_RATES[activeCur] || 1;
+  const sym     = CUR_SYMBOLS[activeCur] || activeCur;
+  const prices  = chartData.map(d => ((d.spot_aed ?? d.display_aed ?? d.aed) || 0) * rate);
+  const minP    = Math.min(...prices), maxP = Math.max(...prices);
+  const rng     = maxP - minP || 0.5;
+  const pad     = rng * 0.12;
+  const lo = minP - pad, hi = maxP + pad;
+  const PW = W - PAD.left - PAD.right, PH = H - PAD.top - PAD.bottom;
+  const xOf = i => PAD.left + (i/(chartData.length-1)) * PW;
+  const yOf = v => PAD.top  + (1 - (v-lo)/(hi-lo)) * PH;
 
   // Grid + Y labels
-  for(let i=0;i<=5;i++){
-    const v=lo+(hi-lo)*(i/5),y=yOf(v);
-    ctx.beginPath();ctx.moveTo(PAD.left,y);ctx.lineTo(PAD.left+PW,y);
-    ctx.strokeStyle=C.border;ctx.globalAlpha=.4;ctx.lineWidth=1;ctx.stroke();ctx.globalAlpha=1;
-    ctx.fillStyle=C.muted;ctx.font='10px "DM Mono",monospace';ctx.textAlign='right';
-    ctx.fillText(v.toFixed(2),PAD.left-5,y+3.5);
+  for (let i = 0; i <= 5; i++) {
+    const v = lo + (hi-lo)*(i/5), y = yOf(v);
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left+PW, y);
+    ctx.strokeStyle = C.border; ctx.globalAlpha = .45; ctx.lineWidth = 1; ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = C.muted; ctx.font = '10px "DM Mono",monospace'; ctx.textAlign = 'right';
+    ctx.fillText(sym + ' ' + v.toFixed(2), PAD.left-5, y+3.5);
   }
 
-  // X labels (time)
-  ctx.fillStyle=C.muted;ctx.textAlign='center';ctx.font='10px "DM Mono",monospace';
-  const xt=Math.min(8,chartData.length);
-  for(let i=0;i<xt;i++){
-    const idx=Math.round(i/(xt-1)*(chartData.length-1));
-    const d=chartData[idx];if(!d)continue;
-    const dt=new Date(d.ts*1000);
-    const lbl=dt.toLocaleTimeString('en-AE',{timeZone:'Asia/Dubai',hour:'2-digit',minute:'2-digit',hour12:false});
-    ctx.fillText(lbl,xOf(idx),H-8);
+  // X labels
+  ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.font = '10px "DM Mono",monospace';
+  const xt = Math.min(8, chartData.length);
+  for (let i = 0; i < xt; i++) {
+    const idx = Math.round(i/(xt-1) * (chartData.length-1));
+    const d = chartData[idx]; if (!d) continue;
+    const dt = new Date(d.ts*1000);
+    const lbl = dt.toLocaleTimeString('en-AE',{timeZone:'Asia/Dubai',hour:'2-digit',minute:'2-digit',hour12:false});
+    ctx.fillText(lbl, xOf(idx), H-8);
   }
 
-  // Reference lines (AED values from OHLC display elements)
-  const refs=[
-    {id:'ohlcSessLow',color:C.red},
-    {id:'ohlcPmLow',color:C.yellow},
-    {id:'ohlcHigh',color:C.green},
-  ];
-  refs.forEach(({id,color})=>{
-    const el=document.getElementById(id);if(!el)return;
-    const val=parseFloat(el.textContent.replace(/[^0-9.]/g,''));
-    if(!val||val<lo||val>hi)return;
-    const y=yOf(val);
-    ctx.save();ctx.strokeStyle=color;ctx.globalAlpha=.45;ctx.lineWidth=1;
-    ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(PAD.left,y);ctx.lineTo(PAD.left+PW,y);ctx.stroke();
-    ctx.setLineDash([]);ctx.restore();
+  // Reference lines
+  const getRefVal = id => {
+    const el = document.getElementById(id); if (!el) return null;
+    const raw = el.textContent.replace(/[^0-9.]/g,'');
+    return raw ? parseFloat(raw) * rate : null;
+  };
+  [
+    {id:'ohlcSessLow', color:C.red},
+    {id:'ohlcPmLow',   color:C.yellow},
+    {id:'ohlcHigh',    color:C.green},
+  ].forEach(({id,color}) => {
+    const val = getRefVal(id); if (!val || val<lo || val>hi) return;
+    const y = yOf(val);
+    ctx.save(); ctx.strokeStyle=color; ctx.globalAlpha=.45; ctx.lineWidth=1;
+    ctx.setLineDash([4,4]); ctx.beginPath(); ctx.moveTo(PAD.left,y); ctx.lineTo(PAD.left+PW,y); ctx.stroke();
+    ctx.setLineDash([]); ctx.restore();
   });
 
   // Fill gradient
-  const grad=ctx.createLinearGradient(0,PAD.top,0,PAD.top+PH);
-  grad.addColorStop(0,'rgba(212,168,67,.2)');grad.addColorStop(1,'rgba(212,168,67,0)');
+  const grad = ctx.createLinearGradient(0, PAD.top, 0, PAD.top+PH);
+  grad.addColorStop(0, 'rgba(212,168,67,.2)'); grad.addColorStop(1,'rgba(212,168,67,0)');
   ctx.beginPath();
-  prices.forEach((p,i)=>{const x=xOf(i),y=yOf(p);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
-  ctx.lineTo(xOf(prices.length-1),PAD.top+PH);ctx.lineTo(xOf(0),PAD.top+PH);ctx.closePath();
-  ctx.fillStyle=grad;ctx.fill();
+  prices.forEach((p,i) => { const x=xOf(i),y=yOf(p); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  ctx.lineTo(xOf(prices.length-1), PAD.top+PH); ctx.lineTo(xOf(0), PAD.top+PH); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
 
   // Price line
   ctx.beginPath();
-  prices.forEach((p,i)=>{const x=xOf(i),y=yOf(p);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
-  ctx.strokeStyle=C.gold;ctx.lineWidth=2;ctx.lineJoin='round';
-  ctx.shadowColor='rgba(212,168,67,.4)';ctx.shadowBlur=6;ctx.stroke();ctx.shadowBlur=0;
+  prices.forEach((p,i) => { const x=xOf(i),y=yOf(p); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  ctx.strokeStyle = C.gold; ctx.lineWidth = 2; ctx.lineJoin = 'round';
+  ctx.shadowColor = 'rgba(212,168,67,.4)'; ctx.shadowBlur = 6; ctx.stroke(); ctx.shadowBlur = 0;
 
   // Alert markers
-  alertData.forEach(al=>{
-    let ci=0,cd=Infinity;
-    chartData.forEach((d,i)=>{const df=Math.abs(d.ts-al.ts);if(df<cd){cd=df;ci=i;}});
-    if(cd>120)return;
-    const x=xOf(ci),y=yOf(prices[ci]);
-    ctx.save();ctx.strokeStyle=al.key==='day_low'?C.red:'rgba(212,168,67,.65)';ctx.globalAlpha=.5;ctx.lineWidth=1;ctx.setLineDash([2,4]);
-    ctx.beginPath();ctx.moveTo(x,PAD.top);ctx.lineTo(x,PAD.top+PH);ctx.stroke();ctx.setLineDash([]);
-    ctx.globalAlpha=1;ctx.fillStyle=al.key==='day_low'?C.red:C.gold2;
-    ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();ctx.restore();
+  alertData.forEach(al => {
+    let ci=0, cd=Infinity;
+    chartData.forEach((d,i) => { const df=Math.abs(d.ts-al.ts); if(df<cd){cd=df;ci=i;} });
+    if (cd>120) return;
+    const x=xOf(ci), y=yOf(prices[ci]);
+    ctx.save(); ctx.strokeStyle=al.key==='day_low'?C.red:'rgba(212,168,67,.65)'; ctx.globalAlpha=.5; ctx.lineWidth=1; ctx.setLineDash([2,4]);
+    ctx.beginPath(); ctx.moveTo(x,PAD.top); ctx.lineTo(x,PAD.top+PH); ctx.stroke(); ctx.setLineDash([]);
+    ctx.globalAlpha=1; ctx.fillStyle=al.key==='day_low'?C.red:C.gold2;
+    ctx.beginPath(); ctx.arc(x,y,4,0,Math.PI*2); ctx.fill(); ctx.restore();
   });
 
-  // Hover crosshair + tooltip
-  if(hoveredIdx!==null&&hoveredIdx>=0&&hoveredIdx<prices.length){
-    const x=xOf(hoveredIdx),y=yOf(prices[hoveredIdx]);
-    ctx.save();ctx.strokeStyle=C.muted;ctx.globalAlpha=.4;ctx.lineWidth=1;ctx.setLineDash([3,3]);
-    ctx.beginPath();ctx.moveTo(x,PAD.top);ctx.lineTo(x,PAD.top+PH);ctx.stroke();
-    ctx.beginPath();ctx.moveTo(PAD.left,y);ctx.lineTo(PAD.left+PW,y);ctx.stroke();
-    ctx.setLineDash([]);ctx.globalAlpha=1;
-    ctx.fillStyle=C.gold2;ctx.shadowColor='rgba(240,197,96,.6)';ctx.shadowBlur=8;
-    ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fill();ctx.shadowBlur=0;ctx.restore();
+  // Hover crosshair
+  if (hoveredIdx !== null && hoveredIdx >= 0 && hoveredIdx < prices.length) {
+    const x=xOf(hoveredIdx), y=yOf(prices[hoveredIdx]);
+    ctx.save(); ctx.strokeStyle=C.muted; ctx.globalAlpha=.4; ctx.lineWidth=1; ctx.setLineDash([3,3]);
+    ctx.beginPath(); ctx.moveTo(x,PAD.top); ctx.lineTo(x,PAD.top+PH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(PAD.left,y); ctx.lineTo(PAD.left+PW,y); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha=1;
+    ctx.fillStyle=C.gold2; ctx.shadowColor='rgba(240,197,96,.6)'; ctx.shadowBlur=8;
+    ctx.beginPath(); ctx.arc(x,y,5,0,Math.PI*2); ctx.fill(); ctx.shadowBlur=0; ctx.restore();
 
-    const dt=new Date(chartData[hoveredIdx].ts*1000);
-    const lbl=dt.toLocaleTimeString('en-AE',{timeZone:'Asia/Dubai',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
-    const pval=prices[hoveredIdx];
-    const tip=document.getElementById('chartTip');
-    if(tip){
-      tip.style.display='block';
-      tip.innerHTML=`<strong style="color:var(--gold2);">AED ${pval.toFixed(2)}/g</strong><br>${lbl} UAE`;
-      const tx=x+12,tw=155;
-      tip.style.left=(tx+tw>W?x-tw-8:tx)+'px';
-      tip.style.top=Math.max(PAD.top,y-38)+'px';
+    const dt = new Date(chartData[hoveredIdx].ts*1000);
+    const lbl = dt.toLocaleTimeString('en-AE',{timeZone:'Asia/Dubai',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+    const tip = document.getElementById('chartTip');
+    if (tip) {
+      tip.style.display = 'block';
+      tip.innerHTML = `<strong style="color:var(--gold2);">${sym} ${prices[hoveredIdx].toFixed(2)}/g</strong><br>${lbl} UAE`;
+      const tx=x+12, tw=160;
+      tip.style.left = (tx+tw > W ? x-tw-8 : tx) + 'px';
+      tip.style.top  = Math.max(PAD.top, y-38) + 'px';
     }
   } else {
-    const tip=document.getElementById('chartTip');if(tip)tip.style.display='none';
+    const tip = document.getElementById('chartTip'); if (tip) tip.style.display = 'none';
   }
 
   // Latest dot
-  const lx=xOf(prices.length-1),ly=yOf(prices[prices.length-1]);
-  ctx.fillStyle=C.gold2;ctx.shadowColor='rgba(240,197,96,.7)';ctx.shadowBlur=10;
-  ctx.beginPath();ctx.arc(lx,ly,5,0,Math.PI*2);ctx.fill();ctx.shadowBlur=0;
+  const lx=xOf(prices.length-1), ly=yOf(prices[prices.length-1]);
+  ctx.fillStyle = C.gold2; ctx.shadowColor='rgba(240,197,96,.7)'; ctx.shadowBlur=10;
+  ctx.beginPath(); ctx.arc(lx,ly,5,0,Math.PI*2); ctx.fill(); ctx.shadowBlur=0;
 }
 
-function ptrIdx(cx){
-  const rect=cv.getBoundingClientRect(),PW=rect.width-PAD.left-PAD.right;
+function ptrIdx(cx) {
+  const rect=cv.getBoundingClientRect(), PW=rect.width-PAD.left-PAD.right;
   const rx=cx-rect.left-PAD.left;
-  if(!chartData||chartData.length<2||rx<0||rx>PW)return null;
+  if (!chartData||chartData.length<2||rx<0||rx>PW) return null;
   return Math.round((rx/PW)*(chartData.length-1));
 }
-cv.addEventListener('mousemove',  e=>{hoveredIdx=ptrIdx(e.clientX);drawChart();});
-cv.addEventListener('mouseleave', ()=>{hoveredIdx=null;drawChart();});
-cv.addEventListener('touchmove',  e=>{e.preventDefault();hoveredIdx=ptrIdx(e.touches[0].clientX);drawChart();},{passive:false});
-cv.addEventListener('touchend',   ()=>{hoveredIdx=null;drawChart();});
+cv.addEventListener('mousemove',  e => { hoveredIdx = ptrIdx(e.clientX); drawChart(); });
+cv.addEventListener('mouseleave', ()  => { hoveredIdx = null; drawChart(); });
+cv.addEventListener('touchmove',  e => { e.preventDefault(); hoveredIdx = ptrIdx(e.touches[0].clientX); drawChart(); }, {passive:false});
+cv.addEventListener('touchend',   ()  => { hoveredIdx = null; drawChart(); });
 
 // ══════════════════════════════════════════════════════════════════
 //  API POLLING
 // ══════════════════════════════════════════════════════════════════
-async function pollApi(){
-  try{
-    const res=await fetch(API_URL+'&_='+Date.now(),{cache:'no-store'});
-    if(!res.ok)throw new Error('HTTP '+res.status);
-    const data=await res.json();
+async function pollApi() {
+  try {
+    const res = await fetch(API_URL + '&_=' + Date.now(), {cache:'no-store'});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    // Update RAW values
+    if (data.display_aed)       RAW.displayAed  = parseFloat(data.display_aed);
+    if (data.spot_aed)          RAW.spotAed     = parseFloat(data.spot_aed);
+    if (data.day_open_aed)      RAW.openAed     = parseFloat(data.day_open_aed);
+    if (data.day_high_aed)      RAW.highAed     = parseFloat(data.day_high_aed);
+    if (data.session_low_aed)   RAW.sessLowAed  = parseFloat(data.session_low_aed);
+    if (data.premarket_low_aed) RAW.pmLowAed    = parseFloat(data.premarket_low_aed);
+    if (data.live_tip !== null && data.live_tip !== undefined) RAW.tipUsd = parseFloat(data.live_tip);
+    if (data.karat_prices)      RAW.karatAed    = data.karat_prices;
+    if (data.day_chg !== null && data.day_chg !== undefined) RAW.dayChg = parseFloat(data.day_chg);
 
     // Chart
-    if(data.chart&&data.chart.length>0){
-      chartData=data.chart;
-      document.getElementById('chartPts').textContent=chartData.length;
-      drawChart();
+    if (data.chart && data.chart.length > 0) {
+      chartData = data.chart;
+      document.getElementById('chartPts').textContent = chartData.length;
+    }
+    if (data.alerts) { alertData = data.alerts; renderAlerts(data.alerts); }
+    if (data.pending_notifs && data.pending_notifs.length > 0) {
+      data.pending_notifs.forEach(n => fireNotification(n));
     }
 
-    // Alerts (dedup by ts)
-    if(data.alerts){alertData=data.alerts;renderAlerts(data.alerts);}
-
-    // Pending browser/toast notifications
-    if(data.pending_notifs&&data.pending_notifs.length>0){
-      data.pending_notifs.forEach(n=>fireNotification(n));
-    }
-
-    // Hero price (retail AED)
-    if(data.display_aed){
-      const el=document.getElementById('heroAed');
-      const ov=parseFloat(el.textContent),nv=parseFloat(data.display_aed);
-      if(Math.abs(ov-nv)>0.001){
-        el.textContent=nv.toFixed(2);
-        const hp=document.getElementById('heroPrice');
-        hp.style.transition='color .35s';
-        hp.style.color=nv>ov?'#22c55e':'#ef4444';
-        setTimeout(()=>hp.style.color='',900);
-      }
-    }
+    // Apply currency conversion to all displayed values
+    applyCurrency();
 
     // Day change %
-    if(data.day_chg!==null&&data.day_chg!==undefined){
-      const ce=document.getElementById('heroDayChg');
-      const c=parseFloat(data.day_chg);
-      ce.textContent=c===0?'0.00%':(c>0?'+':'')+c.toFixed(2)+'%';
-      ce.style.color=c>=0?'var(--green)':'var(--red)';
+    if (RAW.dayChg !== null && RAW.dayChg !== undefined) {
+      const c = RAW.dayChg;
+      const ce = document.getElementById('heroDayChg');
+      ce.textContent = c===0?'0.00%':(c>0?'+':'')+c.toFixed(2)+'%';
+      ce.style.color  = c >= 0 ? 'var(--green)' : 'var(--red)';
     }
 
-    // OHLC
-    if(data.day_high_aed)       document.getElementById('ohlcHigh').textContent    ='AED '+parseFloat(data.day_high_aed).toFixed(2);
-    if(data.session_low_aed)    document.getElementById('ohlcSessLow').textContent ='AED '+parseFloat(data.session_low_aed).toFixed(2);
-    if(data.premarket_low_aed)  document.getElementById('ohlcPmLow').textContent   ='AED '+parseFloat(data.premarket_low_aed).toFixed(2);
-
     // Range cursor
-    if(data.day_high_aed&&data.session_low_aed&&data.spot_aed){
-      const lo=parseFloat(data.session_low_aed),hi=parseFloat(data.day_high_aed),cur=parseFloat(data.spot_aed);
-      const rng=hi-lo;
-      const pos=rng>0?Math.min(100,Math.max(0,((cur-lo)/rng)*100)):50;
-      const cursor=document.getElementById('rangeCursor');
-      if(cursor)cursor.style.left=pos.toFixed(1)+'%';
-      document.getElementById('rangeLowLbl').textContent ='Low AED '+lo.toFixed(2);
-      document.getElementById('rangeHighLbl').textContent='High AED '+hi.toFixed(2);
+    if (RAW.highAed && RAW.sessLowAed && RAW.spotAed) {
+      const lo=RAW.sessLowAed, hi=RAW.highAed, cur=RAW.spotAed;
+      const rng=hi-lo, pos=rng>0?Math.min(100,Math.max(0,((cur-lo)/rng)*100)):50;
+      const cursor = document.getElementById('rangeCursor');
+      if (cursor) cursor.style.left = pos.toFixed(1) + '%';
     }
 
     // Timestamps
-    const p=v=>String(v).padStart(2,'0');
-    const now2=new Date();
-    document.getElementById('chartTs').textContent='Updated '+p(now2.getHours())+':'+p(now2.getMinutes())+':'+p(now2.getSeconds());
-    document.getElementById('chartStatus').textContent='Live';
-    document.getElementById('chartStatus').style.color='var(--green)';
-    if(data.last_run_ts){
-      const rd=new Date(data.last_run_ts*1000);
-      const mos=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-      document.getElementById('lastRunStr').textContent=rd.getDate()+' '+mos[rd.getMonth()]+' · '+p(rd.getHours())+':'+p(rd.getMinutes())+':'+p(rd.getSeconds());
-      const ag=Math.round(Date.now()/1000-data.last_run_ts);
-      document.getElementById('ageStr').textContent=ag<120?ag+'s ago':Math.round(ag/60)+'m ago';
+    const p = v => String(v).padStart(2,'0');
+    const now2 = new Date();
+    document.getElementById('chartTs').textContent = 'Updated ' + p(now2.getHours())+':'+p(now2.getMinutes())+':'+p(now2.getSeconds());
+    document.getElementById('chartStatus').textContent = 'Live';
+    document.getElementById('chartStatus').style.color = 'var(--green)';
+    if (data.last_run_ts) {
+      const rd = new Date(data.last_run_ts*1000);
+      const mos = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      document.getElementById('lastRunStr').textContent = rd.getDate()+' '+mos[rd.getMonth()]+' · '+p(rd.getHours())+':'+p(rd.getMinutes())+':'+p(rd.getSeconds());
+      const ag = Math.round(Date.now()/1000 - data.last_run_ts);
+      document.getElementById('ageStr').textContent = ag < 120 ? ag+'s ago' : Math.round(ag/60)+'m ago';
     }
-  }catch(err){
-    console.warn('Poll error:',err);
-    document.getElementById('chartStatus').textContent='Error';
-    document.getElementById('chartStatus').style.color='var(--red)';
+  } catch(err) {
+    console.warn('Poll error:', err);
+    document.getElementById('chartStatus').textContent = 'Error';
+    document.getElementById('chartStatus').style.color = 'var(--red)';
   }
 }
 
 // ══════════════════════════════════════════════════════════════════
 //  INIT
 // ══════════════════════════════════════════════════════════════════
-(function init(){
-  const seed=<?= $seed_json ?>;
-  chartData=seed.chart||[];
-  alertData=seed.alerts||[];
-  // Pre-seed seen ts to avoid firing toasts for old alerts on page load
-  alertData.forEach(al=>{if(al.ts)seenNotifTs.add((al.key||'')+'_'+al.ts);});
+(function init() {
+  const seed = <?= $seed_json ?>;
+  chartData  = seed.chart  || [];
+  alertData  = seed.alerts || [];
+  alertData.forEach(al => { if (al.ts) seenNotifTs.add((al.key||'') + '_' + al.ts); });
   renderAlerts(alertData);
   resizeCanvas();
-  document.getElementById('chartPts').textContent=chartData.length;
+  document.getElementById('chartPts').textContent = chartData.length;
+  // Apply saved currency
+  applyCurrency();
 })();
 
-window.addEventListener('resize',()=>{clearTimeout(window._rzt);window._rzt=setTimeout(resizeCanvas,100);});
+window.addEventListener('resize', () => { clearTimeout(window._rzt); window._rzt = setTimeout(resizeCanvas, 100); });
 pollApi();
-setInterval(pollApi,POLL_MS);
+setInterval(pollApi, POLL_MS);
 </script>
 </body>
 </html>
